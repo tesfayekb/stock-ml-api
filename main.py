@@ -84,7 +84,7 @@ class BacktestRequest(BaseModel):
 
 
 # ── Feature engineering: pivot score_deltas by event_type ────────────────
-MIN_SAMPLES = 15          # ← lowered from 30 for early-stage data collection
+MIN_SAMPLES = 10          # ← lowered from 30 for early-stage data collection
 MAX_WEIGHT = 4.0
 
 
