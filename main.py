@@ -84,7 +84,7 @@ class BacktestRequest(BaseModel):
 
 
 # ── Feature engineering: pivot score_deltas by event_type ────────────────
-MIN_SAMPLES = 30
+MIN_SAMPLES = 15          # ← lowered from 30 for early-stage data collection
 MAX_WEIGHT = 4.0
 
 
@@ -203,6 +203,13 @@ async def train(req: TrainRequest, authorization: Optional[str] = Header(None)):
         raw = fetch_score_deltas(ticker, req.user_id, req.lookback_days)
         log.info(f"  Fetched {len(raw)} score_delta rows for {ticker}")
 
+        if len(raw) < MIN_SAMPLES:
+            return {
+                "status": "insufficient_data",
+                "rows": len(raw),
+                "min_required": MIN_SAMPLES,
+            }
+
         X, y, factor_names = build_factor_matrix(raw, "actual_move_3d")
         if X is None:
             return {
@@ -220,7 +227,7 @@ async def train(req: TrainRequest, authorization: Optional[str] = Header(None)):
         prev_best = prev_state["best_correlation"] if prev_state else None
 
         # ── 3. Train LightGBM with walk-forward validation ──
-        n_splits = min(5, max(2, len(X) // 30))
+        n_splits = min(5, max(2, len(X) // 15))   # ← adjusted for lower threshold
         tscv = TimeSeriesSplit(n_splits=n_splits)
         cv_scores = []
         cv_correlations = []
@@ -233,7 +240,7 @@ async def train(req: TrainRequest, authorization: Optional[str] = Header(None)):
                 learning_rate=0.03,
                 max_depth=4,
                 num_leaves=15,
-                min_child_samples=max(5, len(train_idx) // 20),
+                min_child_samples=max(3, len(train_idx) // 20),  # ← lowered from 5
                 subsample=0.8,
                 colsample_bytree=0.8,
                 reg_alpha=0.1,
@@ -340,6 +347,13 @@ async def backtest(req: BacktestRequest, authorization: Optional[str] = Header(N
         raw = fetch_score_deltas_range(ticker, req.user_id, req.start_date, req.end_date)
         log.info(f"  Fetched {len(raw)} score_delta rows for {ticker}")
 
+        if len(raw) < 10:       # ← lowered from 20 for early-stage testing
+            return {
+                "status": "insufficient_data",
+                "rows": len(raw),
+                "min_required": 10,
+            }
+
         X, y, factor_names = build_factor_matrix(raw, "actual_move_3d")
         if X is None:
             return {
@@ -350,7 +364,7 @@ async def backtest(req: BacktestRequest, authorization: Optional[str] = Header(N
 
         # ── 2. Walk-forward 70/30 split ──
         split = int(len(X) * 0.7)
-        if split < 15 or (len(X) - split) < 10:
+        if split < 8 or (len(X) - split) < 5:    # ← lowered from 15/10
             return {
                 "status": "insufficient_data",
                 "rows": len(raw),
@@ -369,7 +383,7 @@ async def backtest(req: BacktestRequest, authorization: Optional[str] = Header(N
             learning_rate=0.03,
             max_depth=4,
             num_leaves=15,
-            min_child_samples=max(5, len(X_train) // 20),
+            min_child_samples=max(3, len(X_train) // 20),  # ← lowered from 5
             subsample=0.8,
             colsample_bytree=0.8,
             reg_alpha=0.1,
@@ -399,7 +413,7 @@ async def backtest(req: BacktestRequest, authorization: Optional[str] = Header(N
         for i, factor in enumerate(factor_names):
             col = X_test[:, i]
             nonzero = col != 0
-            if nonzero.sum() > 5:
+            if nonzero.sum() > 3:      # ← lowered from 5
                 factor_dir_acc = float(
                     np.sum(np.sign(col[nonzero]) == np.sign(y_test[nonzero]))
                     / nonzero.sum()
