@@ -10,3 +10,4 @@ python-dotenv==1.0.1
 websockets>=12.0
 supabase>=2.0.0
 httpx>=0.27.0
+shap==0.47.2
