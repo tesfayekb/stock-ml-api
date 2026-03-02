@@ -1,11 +1,7 @@
+
 """
 Stock ML Backend — FastAPI service on Railway.
-Queries score_deltas from Supabase, trains LightGBM per-factor models,
-writes optimized weights back to stock_impact_profiles + calibration_state.
-"""
-"""
-Stock ML Backend — FastAPI service on Railway.
-Queries score_deltas from Supabase, trains LightGBM per-factor models,
+Queries score_deltas from Supabase, trains LightGBM/Ridge/MLP per-factor models,
 writes optimized weights back to stock_impact_profiles + calibration_state.
 """
 import os
@@ -15,10 +11,15 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 import lightgbm as lgb
+import torch
+import torch.nn as nn
+from torch.utils.data import TensorDataset, DataLoader
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sklearn.metrics import mean_squared_error
+from sklearn.linear_model import Ridge
+from sklearn.preprocessing import StandardScaler
 
 from supabase_client import (
     fetch_score_deltas,
@@ -78,8 +79,17 @@ class TrainRequest(BaseModel):
     ticker: str
     user_id: str
     lookback_days: int = 365
-    purge_days: int = 2       # Gap 1: days to purge before validation fold
-    embargo_days: int = 1     # Gap 1: days to embargo after validation fold
+    purge_days: int = 2
+    embargo_days: int = 1
+
+
+class TrainEnsembleRequest(BaseModel):
+    ticker: str
+    user_id: str
+    lookback_days: int = 365
+    purge_days: int = 2
+    embargo_days: int = 1
+    models: list[str] = ["lightgbm", "ridge", "mlp"]  # 3-model ensemble
 
 
 class BacktestRequest(BaseModel):
@@ -90,14 +100,14 @@ class BacktestRequest(BaseModel):
 
 
 class ExplainRequest(BaseModel):
-    """Gap 2: SHAP explain endpoint request model."""
+    """SHAP explain endpoint request model."""
     ticker: str
     user_id: str
     features: dict  # { event_type: contribution_value }
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Gap 1: Purged Walk-Forward Cross-Validation
+#  Purged Walk-Forward Cross-Validation
 # ═══════════════════════════════════════════════════════════════════════
 
 class PurgedWalkForwardCV:
@@ -105,9 +115,7 @@ class PurgedWalkForwardCV:
     Walk-forward CV with purge + embargo to prevent information leakage.
 
     - purge_days: Remove training samples within N days BEFORE the validation fold start.
-      This prevents autocorrelated features from leaking future information.
     - embargo_days: Remove training samples within N days AFTER the validation fold end.
-      This prevents post-event drift from contaminating training.
 
     Reference: de Prado, "Advances in Financial Machine Learning" (2018), Ch. 7
     """
@@ -119,17 +127,6 @@ class PurgedWalkForwardCV:
         self.purged_samples = 0
 
     def split(self, X, dates=None):
-        """
-        Generate purged train/val indices.
-
-        Args:
-            X: Feature matrix (n_samples, n_features)
-            dates: Array of date strings (YYYY-MM-DD) corresponding to each row.
-                   If None, falls back to index-based purge.
-
-        Yields:
-            (train_indices, val_indices) tuples
-        """
         n = len(X)
         self.purged_samples = 0
 
@@ -144,7 +141,6 @@ class PurgedWalkForwardCV:
                     continue
 
                 val_start_date = date_arr[val_start]
-
                 purge_start = val_start_date - pd.Timedelta(days=self.purge_days)
 
                 train_mask = np.ones(val_start, dtype=bool)
@@ -176,14 +172,11 @@ class PurgedWalkForwardCV:
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Gap 2: SHAP Feature Attribution
+#  SHAP Feature Attribution
 # ═══════════════════════════════════════════════════════════════════════
 
 def compute_shap_importance(model, X_val, feature_names):
-    """
-    Compute mean absolute SHAP values per feature using TreeExplainer.
-    Returns dict of { feature_name: mean_abs_shap_percentage }.
-    """
+    """Compute mean absolute SHAP values per feature using TreeExplainer."""
     try:
         import shap
         explainer = shap.TreeExplainer(model)
@@ -204,7 +197,7 @@ def compute_shap_importance(model, X_val, feature_names):
 
 
 # ── Feature engineering: pivot score_deltas by event_type ────────────────
-MIN_SAMPLES = 10          # lowered from 30 for early-stage data collection
+MIN_SAMPLES = 10
 MAX_WEIGHT = 4.0
 
 
@@ -220,18 +213,15 @@ def build_factor_matrix(raw_deltas: list[dict], target_col: str = "actual_move_3
     if df.empty:
         return None, None, [], []
 
-    # Compute each factor's contribution
     df["contribution"] = (
         df["predicted_impact"].fillna(0)
         * df["weight_used"].fillna(1)
         * df["decay_at_measurement"].fillna(1)
     )
 
-    # Use measured_date as the grouping key (one observation per day)
     if "measured_date" not in df.columns or df["measured_date"].isna().all():
         df["measured_date"] = pd.to_datetime(df["measured_at"]).dt.date
 
-    # Pivot: rows=dates, columns=event_types, values=sum of contributions
     pivot = df.pivot_table(
         index="measured_date",
         columns="event_type",
@@ -240,14 +230,12 @@ def build_factor_matrix(raw_deltas: list[dict], target_col: str = "actual_move_3
         fill_value=0,
     )
 
-    # Get target: one actual_move per date (they should all be the same for a date)
     targets = (
         df.groupby("measured_date")[target_col]
         .first()
         .reindex(pivot.index)
     )
 
-    # Drop rows where target is NaN
     valid = targets.notna()
     pivot = pivot[valid]
     targets = targets[valid]
@@ -255,12 +243,11 @@ def build_factor_matrix(raw_deltas: list[dict], target_col: str = "actual_move_3
     if len(pivot) < MIN_SAMPLES:
         return None, None, [], []
 
-    # Sort chronologically
     pivot = pivot.sort_index()
     targets = targets.reindex(pivot.index)
 
     factor_names = pivot.columns.tolist()
-    dates = [str(d) for d in pivot.index.tolist()]  # Gap 1: return dates for purged CV
+    dates = [str(d) for d in pivot.index.tolist()]
     return pivot.values, targets.values, factor_names, dates
 
 
@@ -270,17 +257,10 @@ def importances_to_weights(
     market_defaults: dict[str, float],
     current_weights: dict[str, dict],
 ) -> dict[str, float]:
-    """
-    Convert LightGBM feature importances to weight overrides.
-
-    Strategy: scale importances so the most important factor gets a weight
-    proportional to its baseline, capped at MAX_WEIGHT. Less important
-    factors get proportionally smaller weights.
-    """
+    """Convert LightGBM feature importances to weight overrides."""
     if len(importances) == 0:
         return {}
 
-    # Normalize importances to [0, 1]
     total = importances.sum()
     if total == 0:
         return {f: market_defaults.get(f, 1.0) for f in factor_names}
@@ -292,19 +272,369 @@ def importances_to_weights(
         baseline = market_defaults.get(factor, 1.0)
         current = current_weights.get(factor, {}).get("weight_override")
 
-        # Scale: importance-weighted blend between baseline and MAX_WEIGHT
-        # High importance → weight closer to MAX_WEIGHT
-        # Low importance → weight closer to 0
         raw_weight = baseline + normed[i] * (MAX_WEIGHT - baseline) * 2
         raw_weight = np.clip(raw_weight, -MAX_WEIGHT, MAX_WEIGHT)
 
-        # Smooth with current weight if it exists (avoid wild jumps)
         if current is not None:
             raw_weight = 0.6 * raw_weight + 0.4 * current
 
         weights[factor] = round(float(raw_weight), 4)
 
     return weights
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  MLP Neural Network Model
+# ═══════════════════════════════════════════════════════════════════════
+
+class StockMLP(nn.Module):
+    """
+    Simple 2-hidden-layer feed-forward network for stock move prediction.
+
+    Architecture chosen for small-sample regime (10-200 observations):
+    - Narrow layers (32→16) to prevent overfitting
+    - Dropout for regularization
+    - BatchNorm for training stability
+    """
+    def __init__(self, n_features: int, hidden1: int = 32, hidden2: int = 16, dropout: float = 0.3):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(n_features, hidden1),
+            nn.BatchNorm1d(hidden1),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden1, hidden2),
+            nn.BatchNorm1d(hidden2),
+            nn.ReLU(),
+            nn.Dropout(dropout),
+            nn.Linear(hidden2, 1),
+        )
+
+    def forward(self, x):
+        return self.net(x).squeeze(-1)
+
+
+def train_mlp_model(
+    X: np.ndarray,
+    y: np.ndarray,
+    dates: list[str],
+    factor_names: list[str],
+    purge_days: int = 2,
+    embargo_days: int = 1,
+    epochs: int = 200,
+    lr: float = 0.005,
+    batch_size: int = 32,
+    patience: int = 20,
+) -> dict:
+    """
+    Train a feed-forward MLP with purged walk-forward CV.
+    Uses PyTorch with early stopping and cosine LR scheduling.
+    Returns model metrics and gradient-based feature importance as weights.
+    """
+    n_splits = min(5, max(2, len(X) // 15))
+    cv = PurgedWalkForwardCV(n_splits=n_splits, purge_days=purge_days, embargo_days=embargo_days)
+
+    cv_scores = []
+    cv_correlations = []
+    best_model_state = None
+    best_scaler = None
+    best_mse = float("inf")
+
+    for fold, (train_idx, val_idx) in enumerate(cv.split(X, dates=dates)):
+        scaler = StandardScaler()
+        X_train = torch.FloatTensor(scaler.fit_transform(X[train_idx]))
+        y_train = torch.FloatTensor(y[train_idx])
+        X_val = torch.FloatTensor(scaler.transform(X[val_idx]))
+        y_val = torch.FloatTensor(y[val_idx])
+
+        model = StockMLP(n_features=X.shape[1])
+        optimizer = torch.optim.AdamW(model.parameters(), lr=lr, weight_decay=1e-4)
+        scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs)
+        criterion = nn.MSELoss()
+
+        best_val_loss = float("inf")
+        patience_counter = 0
+        best_state = None
+
+        train_ds = TensorDataset(X_train, y_train)
+        train_loader = DataLoader(train_ds, batch_size=min(batch_size, len(X_train)), shuffle=True)
+
+        model.train()
+        for epoch in range(epochs):
+            epoch_loss = 0.0
+            for xb, yb in train_loader:
+                optimizer.zero_grad()
+                pred = model(xb)
+                loss = criterion(pred, yb)
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                optimizer.step()
+                epoch_loss += loss.item()
+            scheduler.step()
+
+            model.eval()
+            with torch.no_grad():
+                val_pred = model(X_val)
+                val_loss = criterion(val_pred, y_val).item()
+            model.train()
+
+            if val_loss < best_val_loss:
+                best_val_loss = val_loss
+                best_state = {k: v.clone() for k, v in model.state_dict().items()}
+                patience_counter = 0
+            else:
+                patience_counter += 1
+                if patience_counter >= patience:
+                    break
+
+        if best_state:
+            model.load_state_dict(best_state)
+
+        model.eval()
+        with torch.no_grad():
+            preds = model(X_val).numpy()
+
+        mse = float(mean_squared_error(y[val_idx], preds))
+        cv_scores.append(mse)
+
+        if len(preds) > 2:
+            corr = float(np.corrcoef(preds, y[val_idx])[0, 1])
+            if not np.isnan(corr):
+                cv_correlations.append(corr)
+
+        if mse < best_mse:
+            best_mse = mse
+            best_model_state = best_state
+            best_scaler = scaler
+
+    if best_model_state is None:
+        return {"status": "insufficient_data", "reason": "no_valid_cv_folds"}
+
+    final_model = StockMLP(n_features=X.shape[1])
+    final_model.load_state_dict(best_model_state)
+    final_model.eval()
+
+    X_full_scaled = torch.FloatTensor(best_scaler.transform(X))
+    with torch.no_grad():
+        full_preds = final_model(X_full_scaled).numpy()
+
+    correlation = float(np.corrcoef(full_preds, y)[0, 1])
+    if np.isnan(correlation):
+        correlation = 0.0
+
+    direction_correct = np.sum(np.sign(full_preds) == np.sign(y))
+    direction_accuracy = float(direction_correct / len(y)) if len(y) > 0 else 0
+
+    # Gradient-based feature importance
+    X_importance = torch.FloatTensor(best_scaler.transform(X))
+    X_importance.requires_grad_(True)
+    out = final_model(X_importance)
+    out.sum().backward()
+    grad_importance = X_importance.grad.abs().mean(dim=0).numpy()
+
+    total_imp = grad_importance.sum()
+    importance = {}
+    for i, fname in enumerate(factor_names):
+        importance[fname] = round(float(grad_importance[i] / total_imp * 100) if total_imp > 0 else 0, 2)
+    importance = dict(sorted(importance.items(), key=lambda x: x[1], reverse=True))
+
+    weights = {}
+    for i, fname in enumerate(factor_names):
+        normed_imp = grad_importance[i] / total_imp if total_imp > 0 else 0
+        raw_w = 1.0 + normed_imp * (MAX_WEIGHT - 1.0) * 2
+        weights[fname] = round(float(np.clip(raw_w, -MAX_WEIGHT, MAX_WEIGHT)), 4)
+
+    return {
+        "status": "trained",
+        "model_type": "mlp",
+        "correlation": round(correlation, 4),
+        "direction_accuracy": round(direction_accuracy, 4),
+        "cv_mse": [round(s, 6) for s in cv_scores],
+        "cv_correlations": [round(c, 4) for c in cv_correlations],
+        "weights": weights,
+        "importance": importance,
+        "observations": len(X),
+        "factors": factor_names,
+        "architecture": "32→16→1 (dropout=0.3, BatchNorm, AdamW)",
+        "purged_samples": cv.purged_samples,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Ridge Regression Model
+# ═══════════════════════════════════════════════════════════════════════
+
+def train_ridge_model(
+    X: np.ndarray,
+    y: np.ndarray,
+    dates: list[str],
+    factor_names: list[str],
+    purge_days: int = 2,
+    embargo_days: int = 1,
+) -> dict:
+    """Train Ridge regression with purged walk-forward CV."""
+    n_splits = min(5, max(2, len(X) // 15))
+    cv = PurgedWalkForwardCV(n_splits=n_splits, purge_days=purge_days, embargo_days=embargo_days)
+
+    cv_scores = []
+    cv_correlations = []
+    best_model = None
+    best_scaler = None
+    best_mse = float("inf")
+
+    for fold, (train_idx, val_idx) in enumerate(cv.split(X, dates=dates)):
+        scaler = StandardScaler()
+        X_train_scaled = scaler.fit_transform(X[train_idx])
+        X_val_scaled = scaler.transform(X[val_idx])
+
+        model = Ridge(alpha=1.0)
+        model.fit(X_train_scaled, y[train_idx])
+        preds = model.predict(X_val_scaled)
+
+        mse = float(mean_squared_error(y[val_idx], preds))
+        cv_scores.append(mse)
+
+        if len(preds) > 2:
+            corr = float(np.corrcoef(preds, y[val_idx])[0, 1])
+            if not np.isnan(corr):
+                cv_correlations.append(corr)
+
+        if mse < best_mse:
+            best_mse = mse
+            best_model = model
+            best_scaler = scaler
+
+    if best_model is None:
+        return {"status": "insufficient_data", "reason": "no_valid_cv_folds"}
+
+    X_scaled = best_scaler.transform(X)
+    full_preds = best_model.predict(X_scaled)
+    correlation = float(np.corrcoef(full_preds, y)[0, 1])
+    if np.isnan(correlation):
+        correlation = 0.0
+
+    direction_correct = np.sum(np.sign(full_preds) == np.sign(y))
+    direction_accuracy = float(direction_correct / len(y)) if len(y) > 0 else 0
+
+    raw_coefs = best_model.coef_ / best_scaler.scale_
+    coef_weights = {}
+    for i, fname in enumerate(factor_names):
+        w = float(raw_coefs[i])
+        w = np.clip(w, -MAX_WEIGHT, MAX_WEIGHT)
+        coef_weights[fname] = round(w, 4)
+
+    abs_coefs = np.abs(raw_coefs)
+    total = abs_coefs.sum()
+    importance = {}
+    for i, fname in enumerate(factor_names):
+        importance[fname] = round(float(abs_coefs[i] / total * 100) if total > 0 else 0, 2)
+
+    return {
+        "status": "trained",
+        "model_type": "ridge",
+        "correlation": round(correlation, 4),
+        "direction_accuracy": round(direction_accuracy, 4),
+        "cv_mse": [round(s, 6) for s in cv_scores],
+        "cv_correlations": [round(c, 4) for c in cv_correlations],
+        "weights": coef_weights,
+        "importance": importance,
+        "observations": len(X),
+        "factors": factor_names,
+        "ridge_alpha": 1.0,
+        "purged_samples": cv.purged_samples,
+    }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  LightGBM Model (extracted from /train)
+# ═══════════════════════════════════════════════════════════════════════
+
+def train_lightgbm_model(
+    X: np.ndarray,
+    y: np.ndarray,
+    dates: list[str],
+    factor_names: list[str],
+    purge_days: int = 2,
+    embargo_days: int = 1,
+    user_id: str = "",
+    ticker: str = "",
+) -> dict:
+    """Train LightGBM with purged walk-forward CV."""
+    n_splits = min(5, max(2, len(X) // 15))
+    cv = PurgedWalkForwardCV(n_splits=n_splits, purge_days=purge_days, embargo_days=embargo_days)
+    cv_scores = []
+    cv_correlations = []
+    best_model = None
+    best_mse = float("inf")
+    best_val_idx = None
+
+    for fold, (train_idx, val_idx) in enumerate(cv.split(X, dates=dates)):
+        model = lgb.LGBMRegressor(
+            n_estimators=200, learning_rate=0.03, max_depth=4,
+            num_leaves=15, min_child_samples=max(3, len(train_idx) // 20),
+            subsample=0.8, colsample_bytree=0.8,
+            reg_alpha=0.1, reg_lambda=0.1, verbose=-1,
+        )
+        model.fit(X[train_idx], y[train_idx])
+        preds = model.predict(X[val_idx])
+        mse = float(mean_squared_error(y[val_idx], preds))
+        cv_scores.append(mse)
+
+        if len(preds) > 2:
+            corr = float(np.corrcoef(preds, y[val_idx])[0, 1])
+            if not np.isnan(corr):
+                cv_correlations.append(corr)
+
+        if mse < best_mse:
+            best_mse = mse
+            best_model = model
+            best_val_idx = val_idx
+
+    if best_model is None:
+        return {"status": "insufficient_data", "reason": "no_valid_cv_folds"}
+
+    full_preds = best_model.predict(X)
+    correlation = float(np.corrcoef(full_preds, y)[0, 1])
+    if np.isnan(correlation):
+        correlation = 0.0
+
+    importances = best_model.feature_importances_
+    importance_dict = {
+        factor_names[i]: int(importances[i])
+        for i in range(len(factor_names))
+    }
+
+    direction_correct = np.sum(np.sign(full_preds) == np.sign(y))
+    direction_accuracy = float(direction_correct / len(y)) if len(y) > 0 else 0
+
+    shap_importance = {}
+    if best_val_idx is not None and len(best_val_idx) >= 3:
+        shap_importance = compute_shap_importance(
+            best_model, X[best_val_idx], factor_names
+        )
+
+    weights = {}
+    total_imp = sum(importances)
+    if total_imp > 0:
+        normed = importances / total_imp
+        for i, factor in enumerate(factor_names):
+            raw_w = 1.0 + normed[i] * (MAX_WEIGHT - 1.0) * 2
+            weights[factor] = round(float(np.clip(raw_w, -MAX_WEIGHT, MAX_WEIGHT)), 4)
+
+    return {
+        "status": "trained",
+        "model_type": "lightgbm",
+        "correlation": round(correlation, 4),
+        "direction_accuracy": round(direction_accuracy, 4),
+        "cv_mse": [round(s, 6) for s in cv_scores],
+        "cv_correlations": [round(c, 4) for c in cv_correlations],
+        "weights": weights,
+        "importance": importance_dict,
+        "shap_importance": shap_importance,
+        "observations": len(X),
+        "factors": factor_names,
+        "purged_samples": cv.purged_samples,
+    }
 
 
 # ── Endpoints ────────────────────────────────────────────────────────────
@@ -347,7 +677,7 @@ async def train(req: TrainRequest, authorization: Optional[str] = Header(None)):
         prev_state = fetch_calibration_state(ticker, req.user_id)
         prev_best = prev_state["best_correlation"] if prev_state else None
 
-        # ── 3. Train LightGBM with purged walk-forward validation (Gap 1) ──
+        # ── 3. Train LightGBM with purged walk-forward validation ──
         n_splits = min(5, max(2, len(X) // 15))
         cv = PurgedWalkForwardCV(
             n_splits=n_splits,
@@ -403,7 +733,6 @@ async def train(req: TrainRequest, authorization: Optional[str] = Header(None)):
             for i in range(len(factor_names))
         }
 
-        # Direction accuracy
         direction_correct = np.sum(np.sign(full_preds) == np.sign(y))
         direction_accuracy = float(direction_correct / len(y)) if len(y) > 0 else 0
 
@@ -414,7 +743,7 @@ async def train(req: TrainRequest, authorization: Optional[str] = Header(None)):
             f"purged_samples={cv.purged_samples}"
         )
 
-        # ── 4b. Gap 2: Compute SHAP importance on best validation fold ──
+        # ── 4b. Compute SHAP importance on best validation fold ──
         shap_importance = {}
         if best_val_idx is not None and len(best_val_idx) >= 3:
             shap_importance = compute_shap_importance(
@@ -467,14 +796,116 @@ async def train(req: TrainRequest, authorization: Optional[str] = Header(None)):
             "weights_written": write_result is not None,
             "regression_note": regression_note,
             "prev_best_correlation": prev_best,
-            "purged_samples": cv.purged_samples,           # Gap 1: audit trail
-            "purge_days": req.purge_days,                   # Gap 1
-            "embargo_days": req.embargo_days,                # Gap 1
-            "shap_importance": shap_importance,             # Gap 2
+            "purged_samples": cv.purged_samples,
+            "purge_days": req.purge_days,
+            "embargo_days": req.embargo_days,
+            "shap_importance": shap_importance,
         }
 
     except Exception as e:
         log.exception(f"Train failed for {ticker}")
+        raise HTTPException(500, str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Ensemble Training Endpoint
+# ═══════════════════════════════════════════════════════════════════════
+
+@app.post("/train-ensemble")
+async def train_ensemble(req: TrainEnsembleRequest, authorization: Optional[str] = Header(None)):
+    """
+    Train multiple models on the same feature matrix.
+    Returns per-model results for the auto-trainer to aggregate.
+    """
+    verify_caller(authorization)
+    ticker = req.ticker.upper()
+    log.info(f"Ensemble train: {ticker}, models={req.models}, user={req.user_id[:8]}...")
+
+    try:
+        # 1. Fetch & build feature matrix (shared across all models)
+        raw = fetch_score_deltas(ticker, req.user_id, req.lookback_days)
+        if len(raw) < MIN_SAMPLES:
+            return {
+                "status": "insufficient_data",
+                "rows": len(raw),
+                "min_required": MIN_SAMPLES,
+            }
+
+        X, y, factor_names, dates = build_factor_matrix(raw, "actual_move_3d")
+        if X is None:
+            return {
+                "status": "insufficient_data",
+                "rows": len(raw),
+                "min_required": MIN_SAMPLES,
+            }
+
+        log.info(f"  Feature matrix: {X.shape[0]}×{X.shape[1]} factors")
+
+        results = {"status": "trained", "ticker": ticker, "models": {}}
+
+        # 2. Train each requested model
+        if "lightgbm" in req.models:
+            lgb_result = train_lightgbm_model(
+                X, y, dates, factor_names,
+                req.purge_days, req.embargo_days,
+                req.user_id, ticker,
+            )
+            results["models"]["lightgbm"] = lgb_result
+
+        if "ridge" in req.models:
+            ridge_result = train_ridge_model(
+                X, y, dates, factor_names,
+                req.purge_days, req.embargo_days,
+            )
+            results["models"]["ridge"] = ridge_result
+
+        if "mlp" in req.models:
+            mlp_result = train_mlp_model(
+                X, y, dates, factor_names,
+                req.purge_days, req.embargo_days,
+            )
+            results["models"]["mlp"] = mlp_result
+
+        # 3. Compute ensemble agreement with correlation-weighted averaging
+        model_predictions = {}
+        for model_name, model_result in results["models"].items():
+            if model_result.get("status") == "trained":
+                model_predictions[model_name] = model_result.get("correlation", 0)
+
+        if len(model_predictions) >= 2:
+            corrs = list(model_predictions.values())
+
+            # Correlation-weighted ensemble weights
+            positive_corrs = {k: max(0.01, v) for k, v in model_predictions.items()}
+            total_corr = sum(positive_corrs.values())
+            model_influence = {k: v / total_corr for k, v in positive_corrs.items()}
+
+            # Aggregate weights across models
+            ensemble_weights = {}
+            for model_name, model_result in results["models"].items():
+                if model_result.get("status") == "trained" and model_result.get("weights"):
+                    influence = model_influence.get(model_name, 1 / len(model_predictions))
+                    for factor, weight in model_result["weights"].items():
+                        if factor not in ensemble_weights:
+                            ensemble_weights[factor] = 0
+                        ensemble_weights[factor] += weight * influence
+
+            ensemble_weights = {k: round(v, 4) for k, v in ensemble_weights.items()}
+
+            results["ensemble"] = {
+                "model_count": len(corrs),
+                "avg_correlation": round(sum(corrs) / len(corrs), 4),
+                "max_correlation": round(max(corrs), 4),
+                "min_correlation": round(min(corrs), 4),
+                "correlation_spread": round(max(corrs) - min(corrs), 4),
+                "model_influence": {k: round(v, 4) for k, v in model_influence.items()},
+                "ensemble_weights": ensemble_weights,
+            }
+
+        return results
+
+    except Exception as e:
+        log.exception(f"Ensemble train failed for {ticker}")
         raise HTTPException(500, str(e))
 
 
@@ -485,7 +916,6 @@ async def backtest(req: BacktestRequest, authorization: Optional[str] = Header(N
     log.info(f"Backtest request: {ticker}, {req.start_date} → {req.end_date}")
 
     try:
-        # ── 1. Fetch data ──
         raw = fetch_score_deltas_range(ticker, req.user_id, req.start_date, req.end_date)
         log.info(f"  Fetched {len(raw)} score_delta rows for {ticker}")
 
@@ -504,9 +934,8 @@ async def backtest(req: BacktestRequest, authorization: Optional[str] = Header(N
                 "min_required": MIN_SAMPLES,
             }
 
-        # ── 2. Walk-forward 70/30 split with Gap 1 purge buffer ──
         split = int(len(X) * 0.7)
-        purge_buffer = 2  # days to exclude around the split point
+        purge_buffer = 2
         train_end = max(0, split - purge_buffer)
         test_start = split
 
@@ -524,7 +953,6 @@ async def backtest(req: BacktestRequest, authorization: Optional[str] = Header(N
 
         log.info(f"  Split: {len(X_train)} train / {len(X_test)} test, {len(factor_names)} factors, {purged_count} purged")
 
-        # ── 3. Train ──
         model = lgb.LGBMRegressor(
             n_estimators=200,
             learning_rate=0.03,
@@ -540,7 +968,6 @@ async def backtest(req: BacktestRequest, authorization: Optional[str] = Header(N
         model.fit(X_train, y_train)
         preds = model.predict(X_test)
 
-        # ── 4. Metrics ──
         mse = float(mean_squared_error(y_test, preds))
         correlation = float(np.corrcoef(preds, y_test)[0, 1])
         if np.isnan(correlation):
@@ -555,7 +982,6 @@ async def backtest(req: BacktestRequest, authorization: Optional[str] = Header(N
             for i in range(len(factor_names))
         }
 
-        # Per-factor accuracy breakdown
         factor_performance = {}
         for i, factor in enumerate(factor_names):
             col = X_test[:, i]
@@ -591,7 +1017,7 @@ async def backtest(req: BacktestRequest, authorization: Optional[str] = Header(N
             "direction_accuracy": round(direction_accuracy, 4),
             "importance": importance_dict,
             "factor_performance": factor_performance,
-            "purged_samples": purged_count,   # Gap 1: audit
+            "purged_samples": purged_count,
         }
 
     except Exception as e:
@@ -600,15 +1026,13 @@ async def backtest(req: BacktestRequest, authorization: Optional[str] = Header(N
 
 
 # ═══════════════════════════════════════════════════════════════════════
-#  Gap 2: SHAP Explain Endpoint
+#  SHAP Explain Endpoint
 # ═══════════════════════════════════════════════════════════════════════
 
 @app.post("/explain")
 async def explain(req: ExplainRequest, authorization: Optional[str] = Header(None)):
     """
     Given a ticker + feature vector, return per-feature SHAP contributions.
-    Re-trains a lightweight model on the ticker's score_deltas to produce
-    SHAP values for the specific prediction.
     """
     verify_caller(authorization)
     try:
@@ -616,9 +1040,7 @@ async def explain(req: ExplainRequest, authorization: Optional[str] = Header(Non
         if len(rows) < MIN_SAMPLES:
             return {"status": "insufficient_data", "rows": len(rows)}
 
-        X, y, factor_names, dates = build_factor_matrix(
-            rows, "actual_move_3d"
-        )
+        X, y, factor_names, dates = build_factor_matrix(rows, "actual_move_3d")
         if X is None:
             return {"status": "insufficient_data"}
 
@@ -636,7 +1058,6 @@ async def explain(req: ExplainRequest, authorization: Optional[str] = Header(Non
         )
         model.fit(X, y)
 
-        # Build feature vector from request
         feature_vector = np.array([[req.features.get(f, 0) for f in factor_names]])
 
         import shap
@@ -659,3 +1080,4 @@ async def explain(req: ExplainRequest, authorization: Optional[str] = Header(Non
     except Exception as e:
         log.exception(f"Explain failed for {req.ticker}")
         raise HTTPException(500, str(e))
+
