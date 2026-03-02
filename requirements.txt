@@ -11,3 +11,4 @@ websockets>=12.0
 supabase>=2.0.0
 httpx>=0.27.0
 shap==0.47.2
+scikit-learn==1.5.2
