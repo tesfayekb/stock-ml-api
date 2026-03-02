@@ -3,6 +3,11 @@ Stock ML Backend — FastAPI service on Railway.
 Queries score_deltas from Supabase, trains LightGBM per-factor models,
 writes optimized weights back to stock_impact_profiles + calibration_state.
 """
+"""
+Stock ML Backend — FastAPI service on Railway.
+Queries score_deltas from Supabase, trains LightGBM per-factor models,
+writes optimized weights back to stock_impact_profiles + calibration_state.
+"""
 import os
 import logging
 from typing import Optional
@@ -13,7 +18,6 @@ import lightgbm as lgb
 from fastapi import FastAPI, HTTPException, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from sklearn.model_selection import TimeSeriesSplit
 from sklearn.metrics import mean_squared_error
 
 from supabase_client import (
@@ -74,6 +78,8 @@ class TrainRequest(BaseModel):
     ticker: str
     user_id: str
     lookback_days: int = 365
+    purge_days: int = 2       # Gap 1: days to purge before validation fold
+    embargo_days: int = 1     # Gap 1: days to embargo after validation fold
 
 
 class BacktestRequest(BaseModel):
@@ -83,8 +89,122 @@ class BacktestRequest(BaseModel):
     end_date: str
 
 
+class ExplainRequest(BaseModel):
+    """Gap 2: SHAP explain endpoint request model."""
+    ticker: str
+    user_id: str
+    features: dict  # { event_type: contribution_value }
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Gap 1: Purged Walk-Forward Cross-Validation
+# ═══════════════════════════════════════════════════════════════════════
+
+class PurgedWalkForwardCV:
+    """
+    Walk-forward CV with purge + embargo to prevent information leakage.
+
+    - purge_days: Remove training samples within N days BEFORE the validation fold start.
+      This prevents autocorrelated features from leaking future information.
+    - embargo_days: Remove training samples within N days AFTER the validation fold end.
+      This prevents post-event drift from contaminating training.
+
+    Reference: de Prado, "Advances in Financial Machine Learning" (2018), Ch. 7
+    """
+
+    def __init__(self, n_splits: int = 3, purge_days: int = 2, embargo_days: int = 1):
+        self.n_splits = n_splits
+        self.purge_days = purge_days
+        self.embargo_days = embargo_days
+        self.purged_samples = 0
+
+    def split(self, X, dates=None):
+        """
+        Generate purged train/val indices.
+
+        Args:
+            X: Feature matrix (n_samples, n_features)
+            dates: Array of date strings (YYYY-MM-DD) corresponding to each row.
+                   If None, falls back to index-based purge.
+
+        Yields:
+            (train_indices, val_indices) tuples
+        """
+        n = len(X)
+        self.purged_samples = 0
+
+        if dates is not None:
+            date_arr = pd.to_datetime(dates)
+            fold_size = n // (self.n_splits + 1)
+
+            for i in range(self.n_splits):
+                val_start = fold_size * (i + 1)
+                val_end = min(val_start + fold_size, n)
+                if val_end - val_start < 3:
+                    continue
+
+                val_start_date = date_arr[val_start]
+
+                purge_start = val_start_date - pd.Timedelta(days=self.purge_days)
+
+                train_mask = np.ones(val_start, dtype=bool)
+                for j in range(val_start):
+                    if date_arr[j] >= purge_start:
+                        train_mask[j] = False
+                        self.purged_samples += 1
+
+                train_idx = np.where(train_mask)[0]
+                val_idx = np.arange(val_start, val_end)
+
+                if len(train_idx) >= 5 and len(val_idx) >= 3:
+                    yield train_idx, val_idx
+        else:
+            fold_size = n // (self.n_splits + 1)
+            for i in range(self.n_splits):
+                val_start = fold_size * (i + 1)
+                val_end = min(val_start + fold_size, n)
+
+                purge_count = min(self.purge_days, val_start)
+                train_end = val_start - purge_count
+                self.purged_samples += purge_count
+
+                train_idx = np.arange(0, train_end)
+                val_idx = np.arange(val_start, val_end)
+
+                if len(train_idx) >= 5 and len(val_idx) >= 3:
+                    yield train_idx, val_idx
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Gap 2: SHAP Feature Attribution
+# ═══════════════════════════════════════════════════════════════════════
+
+def compute_shap_importance(model, X_val, feature_names):
+    """
+    Compute mean absolute SHAP values per feature using TreeExplainer.
+    Returns dict of { feature_name: mean_abs_shap_percentage }.
+    """
+    try:
+        import shap
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(X_val)
+
+        mean_abs_shap = np.abs(shap_values).mean(axis=0)
+        total = mean_abs_shap.sum()
+
+        importance = {}
+        for fname, val in zip(feature_names, mean_abs_shap):
+            importance[fname] = round(float(val / total * 100) if total > 0 else 0, 2)
+
+        importance = dict(sorted(importance.items(), key=lambda x: x[1], reverse=True))
+        return importance
+    except Exception as e:
+        log.warning(f"SHAP computation failed: {e}")
+        return {}
+
+
 # ── Feature engineering: pivot score_deltas by event_type ────────────────
-MIN_SAMPLES = 10          # ← lowered from 30 for early-stage data collection
+MIN_SAMPLES = 10          # lowered from 30 for early-stage data collection
 MAX_WEIGHT = 4.0
 
 
@@ -98,7 +218,7 @@ def build_factor_matrix(raw_deltas: list[dict], target_col: str = "actual_move_3
     """
     df = pd.DataFrame(raw_deltas)
     if df.empty:
-        return None, None, []
+        return None, None, [], []
 
     # Compute each factor's contribution
     df["contribution"] = (
@@ -133,14 +253,15 @@ def build_factor_matrix(raw_deltas: list[dict], target_col: str = "actual_move_3
     targets = targets[valid]
 
     if len(pivot) < MIN_SAMPLES:
-        return None, None, []
+        return None, None, [], []
 
     # Sort chronologically
     pivot = pivot.sort_index()
     targets = targets.reindex(pivot.index)
 
     factor_names = pivot.columns.tolist()
-    return pivot.values, targets.values, factor_names
+    dates = [str(d) for d in pivot.index.tolist()]  # Gap 1: return dates for purged CV
+    return pivot.values, targets.values, factor_names, dates
 
 
 def importances_to_weights(
@@ -210,7 +331,7 @@ async def train(req: TrainRequest, authorization: Optional[str] = Header(None)):
                 "min_required": MIN_SAMPLES,
             }
 
-        X, y, factor_names = build_factor_matrix(raw, "actual_move_3d")
+        X, y, factor_names, dates = build_factor_matrix(raw, "actual_move_3d")
         if X is None:
             return {
                 "status": "insufficient_data",
@@ -226,21 +347,26 @@ async def train(req: TrainRequest, authorization: Optional[str] = Header(None)):
         prev_state = fetch_calibration_state(ticker, req.user_id)
         prev_best = prev_state["best_correlation"] if prev_state else None
 
-        # ── 3. Train LightGBM with walk-forward validation ──
-        n_splits = min(5, max(2, len(X) // 15))   # ← adjusted for lower threshold
-        tscv = TimeSeriesSplit(n_splits=n_splits)
+        # ── 3. Train LightGBM with purged walk-forward validation (Gap 1) ──
+        n_splits = min(5, max(2, len(X) // 15))
+        cv = PurgedWalkForwardCV(
+            n_splits=n_splits,
+            purge_days=req.purge_days,
+            embargo_days=req.embargo_days,
+        )
         cv_scores = []
         cv_correlations = []
         best_model = None
         best_mse = float("inf")
+        best_val_idx = None
 
-        for fold, (train_idx, val_idx) in enumerate(tscv.split(X)):
+        for fold, (train_idx, val_idx) in enumerate(cv.split(X, dates=dates)):
             model = lgb.LGBMRegressor(
                 n_estimators=200,
                 learning_rate=0.03,
                 max_depth=4,
                 num_leaves=15,
-                min_child_samples=max(3, len(train_idx) // 20),  # ← lowered from 5
+                min_child_samples=max(3, len(train_idx) // 20),
                 subsample=0.8,
                 colsample_bytree=0.8,
                 reg_alpha=0.1,
@@ -260,6 +386,10 @@ async def train(req: TrainRequest, authorization: Optional[str] = Header(None)):
             if mse < best_mse:
                 best_mse = mse
                 best_model = model
+                best_val_idx = val_idx
+
+        if best_model is None:
+            return {"status": "insufficient_data", "reason": "no_valid_cv_folds"}
 
         # ── 4. Compute final metrics ──
         full_preds = best_model.predict(X)
@@ -280,8 +410,16 @@ async def train(req: TrainRequest, authorization: Optional[str] = Header(None)):
         log.info(
             f"  Training complete: corr={correlation:.3f}, "
             f"dir_acc={direction_accuracy:.1%}, "
-            f"cv_mse={cv_scores}, factors={len(factor_names)}"
+            f"cv_mse={cv_scores}, factors={len(factor_names)}, "
+            f"purged_samples={cv.purged_samples}"
         )
+
+        # ── 4b. Gap 2: Compute SHAP importance on best validation fold ──
+        shap_importance = {}
+        if best_val_idx is not None and len(best_val_idx) >= 3:
+            shap_importance = compute_shap_importance(
+                best_model, X[best_val_idx], factor_names
+            )
 
         # ── 5. Convert importances → weight overrides ──
         optimized_weights = importances_to_weights(
@@ -329,6 +467,10 @@ async def train(req: TrainRequest, authorization: Optional[str] = Header(None)):
             "weights_written": write_result is not None,
             "regression_note": regression_note,
             "prev_best_correlation": prev_best,
+            "purged_samples": cv.purged_samples,           # Gap 1: audit trail
+            "purge_days": req.purge_days,                   # Gap 1
+            "embargo_days": req.embargo_days,                # Gap 1
+            "shap_importance": shap_importance,             # Gap 2
         }
 
     except Exception as e:
@@ -347,14 +489,14 @@ async def backtest(req: BacktestRequest, authorization: Optional[str] = Header(N
         raw = fetch_score_deltas_range(ticker, req.user_id, req.start_date, req.end_date)
         log.info(f"  Fetched {len(raw)} score_delta rows for {ticker}")
 
-        if len(raw) < 10:       # ← lowered from 20 for early-stage testing
+        if len(raw) < 10:
             return {
                 "status": "insufficient_data",
                 "rows": len(raw),
                 "min_required": 10,
             }
 
-        X, y, factor_names = build_factor_matrix(raw, "actual_move_3d")
+        X, y, factor_names, dates = build_factor_matrix(raw, "actual_move_3d")
         if X is None:
             return {
                 "status": "insufficient_data",
@@ -362,20 +504,25 @@ async def backtest(req: BacktestRequest, authorization: Optional[str] = Header(N
                 "min_required": MIN_SAMPLES,
             }
 
-        # ── 2. Walk-forward 70/30 split ──
+        # ── 2. Walk-forward 70/30 split with Gap 1 purge buffer ──
         split = int(len(X) * 0.7)
-        if split < 8 or (len(X) - split) < 5:    # ← lowered from 15/10
+        purge_buffer = 2  # days to exclude around the split point
+        train_end = max(0, split - purge_buffer)
+        test_start = split
+
+        if train_end < 8 or (len(X) - test_start) < 5:
             return {
                 "status": "insufficient_data",
                 "rows": len(raw),
                 "observations": len(X),
-                "reason": "Not enough data for 70/30 split",
+                "reason": "Not enough data for 70/30 split after purge",
             }
 
-        X_train, y_train = X[:split], y[:split]
-        X_test, y_test = X[split:], y[split:]
+        X_train, y_train = X[:train_end], y[:train_end]
+        X_test, y_test = X[test_start:], y[test_start:]
+        purged_count = split - train_end
 
-        log.info(f"  Split: {len(X_train)} train / {len(X_test)} test, {len(factor_names)} factors")
+        log.info(f"  Split: {len(X_train)} train / {len(X_test)} test, {len(factor_names)} factors, {purged_count} purged")
 
         # ── 3. Train ──
         model = lgb.LGBMRegressor(
@@ -383,7 +530,7 @@ async def backtest(req: BacktestRequest, authorization: Optional[str] = Header(N
             learning_rate=0.03,
             max_depth=4,
             num_leaves=15,
-            min_child_samples=max(3, len(X_train) // 20),  # ← lowered from 5
+            min_child_samples=max(3, len(X_train) // 20),
             subsample=0.8,
             colsample_bytree=0.8,
             reg_alpha=0.1,
@@ -413,7 +560,7 @@ async def backtest(req: BacktestRequest, authorization: Optional[str] = Header(N
         for i, factor in enumerate(factor_names):
             col = X_test[:, i]
             nonzero = col != 0
-            if nonzero.sum() > 3:      # ← lowered from 5
+            if nonzero.sum() > 3:
                 factor_dir_acc = float(
                     np.sum(np.sign(col[nonzero]) == np.sign(y_test[nonzero]))
                     / nonzero.sum()
@@ -436,16 +583,79 @@ async def backtest(req: BacktestRequest, authorization: Optional[str] = Header(N
             "end_date": req.end_date,
             "rows": len(raw),
             "observations": len(X),
-            "samples_train": split,
-            "samples_test": len(X) - split,
+            "samples_train": len(X_train),
+            "samples_test": len(X_test),
             "factors": factor_names,
             "mse": round(mse, 6),
             "correlation": round(correlation, 4),
             "direction_accuracy": round(direction_accuracy, 4),
             "importance": importance_dict,
             "factor_performance": factor_performance,
+            "purged_samples": purged_count,   # Gap 1: audit
         }
 
     except Exception as e:
         log.exception(f"Backtest failed for {ticker}")
+        raise HTTPException(500, str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Gap 2: SHAP Explain Endpoint
+# ═══════════════════════════════════════════════════════════════════════
+
+@app.post("/explain")
+async def explain(req: ExplainRequest, authorization: Optional[str] = Header(None)):
+    """
+    Given a ticker + feature vector, return per-feature SHAP contributions.
+    Re-trains a lightweight model on the ticker's score_deltas to produce
+    SHAP values for the specific prediction.
+    """
+    verify_caller(authorization)
+    try:
+        rows = fetch_score_deltas(req.ticker, req.user_id, 365)
+        if len(rows) < MIN_SAMPLES:
+            return {"status": "insufficient_data", "rows": len(rows)}
+
+        X, y, factor_names, dates = build_factor_matrix(
+            rows, "actual_move_3d"
+        )
+        if X is None:
+            return {"status": "insufficient_data"}
+
+        model = lgb.LGBMRegressor(
+            n_estimators=200,
+            learning_rate=0.03,
+            max_depth=4,
+            num_leaves=15,
+            min_child_samples=max(3, len(X) // 20),
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=0.1,
+            verbose=-1,
+        )
+        model.fit(X, y)
+
+        # Build feature vector from request
+        feature_vector = np.array([[req.features.get(f, 0) for f in factor_names]])
+
+        import shap
+        explainer = shap.TreeExplainer(model)
+        shap_values = explainer.shap_values(feature_vector)[0]
+
+        contributions = {
+            fname: round(float(sv), 4)
+            for fname, sv in zip(factor_names, shap_values)
+        }
+        contributions = dict(sorted(contributions.items(), key=lambda x: abs(x[1]), reverse=True))
+
+        return {
+            "status": "ok",
+            "ticker": req.ticker,
+            "prediction": float(model.predict(feature_vector)[0]),
+            "shap_contributions": contributions,
+            "base_value": float(explainer.expected_value),
+        }
+    except Exception as e:
+        log.exception(f"Explain failed for {req.ticker}")
         raise HTTPException(500, str(e))
