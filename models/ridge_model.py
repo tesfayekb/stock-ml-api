@@ -1,4 +1,3 @@
-
 """Ridge regression model trainer with purged walk-forward CV."""
 
 import numpy as np
