@@ -1,5 +1,3 @@
-
-
 """Model trainers — re-export all model training functions."""
 
 from models.lightgbm_model import train_lightgbm_model
