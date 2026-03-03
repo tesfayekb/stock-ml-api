@@ -1,6 +1,6 @@
 
 
-```python
+
 """
 Purged Walk-Forward Cross-Validation.
 
@@ -78,4 +78,4 @@ class PurgedWalkForwardCV:
 
                 if len(train_idx) >= 5 and len(val_idx) >= 3:
                     yield train_idx, val_idx
-```
+
