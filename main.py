@@ -121,6 +121,7 @@ def _run_ensemble_training_sync(req: TrainEnsembleRequest) -> dict:
         return {
             "status": "insufficient_data",
             "ticker": ticker,
+            "user_id": req.user_id,
             "rows": len(raw),
             "min_required": MIN_SAMPLES,
             "success": False,
@@ -131,6 +132,7 @@ def _run_ensemble_training_sync(req: TrainEnsembleRequest) -> dict:
         return {
             "status": "insufficient_data",
             "ticker": ticker,
+            "user_id": req.user_id,
             "rows": len(raw),
             "min_required": MIN_SAMPLES,
             "success": False,
