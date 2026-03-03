@@ -1,6 +1,6 @@
 
 
-```python
+
 """
 Stock ML Backend — FastAPI service on Railway.
 Queries score_deltas from Supabase, trains LightGBM/Ridge/MLP per-factor models,
