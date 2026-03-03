@@ -1,5 +1,5 @@
 
-```python
+
 """
 Feature engineering: pivot score_deltas into factor matrices,
 convert importances to weights, and compute SHAP attribution.
@@ -128,4 +128,4 @@ def compute_shap_importance(model, X_val, feature_names) -> dict:
     except Exception as e:
         log.warning(f"SHAP computation failed: {e}")
         return {}
-```
+
