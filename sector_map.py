@@ -1,6 +1,3 @@
-
-
-```python
 """Sector classification map — mirrors edge function sector assignments."""
 
 SECTOR_MAP: dict[str, str] = {}
@@ -28,4 +25,4 @@ _sm("Crypto/Blockchain", ["IREN","CLSK","MARA","RIOT","HUT","BITF","WULF","CIFR"
 def get_sector(ticker: str) -> str:
     """Return sector for a ticker, or 'unknown' if not mapped."""
     return SECTOR_MAP.get(ticker, "unknown")
-```
+
