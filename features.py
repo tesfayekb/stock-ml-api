@@ -1,5 +1,3 @@
-
-
 """
 Feature engineering: pivot score_deltas into factor matrices,
 convert importances to weights, and compute SHAP attribution.
