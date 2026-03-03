@@ -1,6 +1,3 @@
-
-
-
 """
 Purged Walk-Forward Cross-Validation.
 
