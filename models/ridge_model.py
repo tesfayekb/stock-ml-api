@@ -1,5 +1,4 @@
 
-```python
 """Ridge regression model trainer with purged walk-forward CV."""
 
 import numpy as np
@@ -90,4 +89,4 @@ def train_ridge_model(
         "ridge_alpha": 1.0,
         "purged_samples": cv.purged_samples,
     }
-```
+
