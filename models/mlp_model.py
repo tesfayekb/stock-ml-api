@@ -1,6 +1,3 @@
-
-
-```python
 """
 MLP Neural Network model trainer with purged walk-forward CV.
 Uses PyTorch with early stopping and cosine LR scheduling.
@@ -187,4 +184,4 @@ def train_mlp_model(
         "architecture": "32→16→1 (dropout=0.3, BatchNorm, AdamW)",
         "purged_samples": cv.purged_samples,
     }
-```
+
