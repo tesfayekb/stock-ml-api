@@ -1,5 +1,3 @@
-
-
 """LightGBM model trainer with purged walk-forward CV and SHAP."""
 
 import numpy as np
