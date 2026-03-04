@@ -88,6 +88,14 @@ class ExplainRequest(BaseModel):
     user_id: str
     features: dict  # { event_type: contribution_value }
 
+class TrainIncrementalRequest(BaseModel):
+    ticker: str
+    user_id: str
+    lookback_days: int = 30       # context window
+    new_data_hours: int = 48      # only train on recent data
+    purge_days: int = 2
+    embargo_days: int = 1
+    callback_url: str | None = None
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Async Webhook Helpers
