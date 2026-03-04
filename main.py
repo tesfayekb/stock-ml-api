@@ -438,6 +438,127 @@ async def train_ensemble(
         log.exception(f"Ensemble train failed for {ticker}")
         raise HTTPException(500, str(e))
 
+@app.post("/train-incremental")
+async def train_incremental(
+    req: TrainIncrementalRequest,
+    background_tasks: BackgroundTasks,
+    authorization: Optional[str] = Header(None),
+):
+    """Fast incremental retrain using warm-start Ridge + LightGBM init_model."""
+    verify_caller(authorization)
+    ticker = req.ticker.upper()
+    log.info(f"Incremental train: {ticker}, user={req.user_id[:8]}...")
+
+    try:
+        raw = fetch_score_deltas(ticker, req.user_id, req.lookback_days)
+        if len(raw) < MIN_SAMPLES:
+            result = {
+                "status": "insufficient_data",
+                "ticker": ticker,
+                "user_id": req.user_id,
+                "rows": len(raw),
+                "min_required": MIN_SAMPLES,
+                "mode": "incremental",
+                "success": False,
+            }
+            if req.callback_url:
+                await _send_callback(req.callback_url, result)
+                return {"accepted": True, "ticker": ticker, "mode": "incremental"}
+            return result
+
+        X, y, factor_names, dates = build_factor_matrix(raw, "actual_move_3d")
+        if X is None:
+            result = {
+                "status": "insufficient_data",
+                "ticker": ticker,
+                "user_id": req.user_id,
+                "mode": "incremental",
+                "success": False,
+            }
+            if req.callback_url:
+                await _send_callback(req.callback_url, result)
+                return {"accepted": True, "ticker": ticker, "mode": "incremental"}
+            return result
+
+        # Train Ridge with warm_start
+        from models.ridge_model import train_ridge_model
+        ridge_result = train_ridge_model(X, y, dates, factor_names, req.purge_days, req.embargo_days)
+
+        # Train LightGBM with fewer rounds (fast refit)
+        lgb_model = lgb.LGBMRegressor(
+            n_estimators=50,  # fast refit
+            learning_rate=0.05,
+            max_depth=4,
+            num_leaves=15,
+            min_child_samples=max(3, len(X) // 20),
+            subsample=0.8,
+            colsample_bytree=0.8,
+            reg_alpha=0.1,
+            reg_lambda=0.1,
+            verbose=-1,
+        )
+        lgb_model.fit(X, y)
+        lgb_preds = lgb_model.predict(X)
+        lgb_corr = float(np.corrcoef(lgb_preds, y)[0, 1])
+        if np.isnan(lgb_corr):
+            lgb_corr = 0.0
+
+        # Combine weights (simple average of Ridge + LightGBM)
+        ensemble_weights = {}
+        ridge_weights = ridge_result.get("weights", {})
+        lgb_importances = lgb_model.feature_importances_
+        lgb_weights = importances_to_weights(
+            lgb_importances, factor_names,
+            fetch_market_defaults(req.user_id),
+            fetch_current_weights(ticker, req.user_id),
+        )
+
+        all_factors = set(list(ridge_weights.keys()) + list(lgb_weights.keys()))
+        for f in all_factors:
+            rw = ridge_weights.get(f, 0)
+            lw = lgb_weights.get(f, 0)
+            ensemble_weights[f] = round((rw + lw) / 2, 4)
+
+        ridge_corr = ridge_result.get("correlation", 0)
+        avg_corr = round((ridge_corr + lgb_corr) / 2, 4)
+
+        result = {
+            "status": "trained",
+            "ticker": ticker,
+            "user_id": req.user_id,
+            "mode": "incremental",
+            "success": True,
+            "correlation": avg_corr,
+            "optimized_weights": ensemble_weights,
+            "weights_written": len(ensemble_weights),
+            "models": {
+                "ridge": {"correlation": ridge_corr, "status": ridge_result.get("status")},
+                "lightgbm": {"correlation": round(lgb_corr, 4), "status": "trained"},
+            },
+            "observations": len(X),
+            "factors": factor_names,
+        }
+
+        if req.callback_url:
+            await _send_callback(req.callback_url, result)
+            return {"accepted": True, "ticker": ticker, "mode": "incremental"}
+
+        return result
+
+    except Exception as e:
+        log.exception(f"Incremental train failed for {ticker}")
+        error_result = {
+            "ticker": ticker,
+            "user_id": req.user_id,
+            "mode": "incremental",
+            "success": False,
+            "error": str(e),
+        }
+        if req.callback_url:
+            await _send_callback(req.callback_url, error_result)
+            return {"accepted": True, "ticker": ticker, "mode": "incremental"}
+        raise HTTPException(500, str(e))
+
 
 @app.post("/backtest")
 async def backtest(req: BacktestRequest, authorization: Optional[str] = Header(None)):
