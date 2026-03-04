@@ -17,9 +17,23 @@ def train_ridge_model(
     purge_days: int = 2,
     embargo_days: int = 1,
 ) -> dict:
-    """Train Ridge regression with purged walk-forward CV."""
+    """Train Ridge regression with purged walk-forward CV.
+    
+    Uses adaptive alpha: lower regularization for small feature sets
+    to allow more differentiation from equal-weight baseline.
+    """
     n_splits = min(5, max(2, len(X) // 15))
     cv = PurgedWalkForwardCV(n_splits=n_splits, purge_days=purge_days, embargo_days=embargo_days)
+
+    # Adaptive alpha: less shrinkage when we have more features and data
+    n_features = X.shape[1]
+    n_samples = X.shape[0]
+    if n_features >= 8 and n_samples >= 20:
+        alpha = 0.3   # Enriched feature set — allow differentiation
+    elif n_features >= 5:
+        alpha = 0.5   # Moderate features
+    else:
+        alpha = 1.0   # Sparse — regularize more
 
     cv_scores = []
     cv_correlations = []
@@ -32,7 +46,7 @@ def train_ridge_model(
         X_train_scaled = scaler.fit_transform(X[train_idx])
         X_val_scaled = scaler.transform(X[val_idx])
 
-        model = Ridge(alpha=1.0)
+        model = Ridge(alpha=alpha)
         model.fit(X_train_scaled, y[train_idx])
         preds = model.predict(X_val_scaled)
 
@@ -85,7 +99,7 @@ def train_ridge_model(
         "importance": importance,
         "observations": len(X),
         "factors": factor_names,
-        "ridge_alpha": 1.0,
+        "ridge_alpha": alpha,
         "purged_samples": cv.purged_samples,
     }
 
