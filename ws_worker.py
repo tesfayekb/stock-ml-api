@@ -182,11 +182,9 @@ async def connect_and_stream():
 
                         for event in events:
                             ev_type = event.get("ev")
-                            if ev_type != "AM":
-                                logger.info(f"Non-AM event: {event}")
-                                continue
 
-                            if ev_type != "AM":        # CHANGED: was "T"
+                            if ev_type != "AM":   # CHANGED: was "T"
+                                logger.info(f"Non-AM event: {event}")
                                 continue
 
                             ticker = event.get("sym", "")
