@@ -1,7 +1,7 @@
 """
 Polygon.io WebSocket → Supabase live_ticks worker.
 
-Connects to Polygon's Stocks WebSocket, subscribes to trade events,
+Connects to Polygon's Stocks WebSocket, subscribes to minute aggregate events (AM.*),
 and upserts price ticks to Supabase for Realtime broadcast to the frontend.
 
 Key design decisions:
@@ -119,7 +119,7 @@ async def ticker_refresher(ws, current_tickers: set):
             if to_add:
                 sub_msg = json.dumps({
                     "action": "subscribe",
-                    "params": ",".join(f"T.{t}" for t in to_add)
+                    "params": ",".join(f"AM.{t}" for t in to_add)  # CHANGED: T.* → AM.*
                 })
                 await ws.send(sub_msg)
                 logger.info(f"Subscribed to {len(to_add)} new tickers: {sorted(to_add)[:10]}...")
@@ -128,7 +128,7 @@ async def ticker_refresher(ws, current_tickers: set):
             if to_remove:
                 unsub_msg = json.dumps({
                     "action": "unsubscribe",
-                    "params": ",".join(f"T.{t}" for t in to_remove)
+                    "params": ",".join(f"AM.{t}" for t in to_remove)  # CHANGED: T.* → AM.*
                 })
                 await ws.send(unsub_msg)
                 logger.info(f"Unsubscribed from {len(to_remove)} tickers")
@@ -163,12 +163,13 @@ async def connect_and_stream():
                     await asyncio.sleep(10)
                     continue
 
+                # CHANGED: Subscribe to minute aggregates instead of trades
                 tickers = get_watched_tickers()
                 current_tickers = set(tickers)
-                sub_params = ",".join(f"T.{t}" for t in tickers)
+                sub_params = ",".join(f"AM.{t}" for t in tickers)  # CHANGED: T.* → AM.*
                 sub_msg = json.dumps({"action": "subscribe", "params": sub_params})
                 await ws.send(sub_msg)
-                logger.info(f"Subscribed to {len(tickers)} tickers")
+                logger.info(f"Subscribed to {len(tickers)} tickers (AM.* minute aggregates)")
 
                 flusher_task = asyncio.create_task(buffer_flusher())
                 refresher_task = asyncio.create_task(ticker_refresher(ws, current_tickers))
@@ -181,14 +182,13 @@ async def connect_and_stream():
 
                         for event in events:
                             ev_type = event.get("ev")
-                            if ev_type != "T":
+                            if ev_type != "AM":        # CHANGED: was "T"
                                 continue
 
                             ticker = event.get("sym", "")
-                            price = event.get("p", 0)
-                            size = event.get("s", 0)
-                            timestamp = event.get("t", 0)
-                            conditions = event.get("c", [])
+                            price = event.get("c", 0)  # CHANGED: minute close (was "p" trade price)
+                            size = event.get("v", 0)   # CHANGED: aggregate volume (was "s" trade size)
+                            timestamp = event.get("e", 0)  # CHANGED: end timestamp (was "t")
 
                             if not ticker or not price:
                                 continue
@@ -199,7 +199,7 @@ async def connect_and_stream():
                                     "price": float(price),
                                     "size": int(size),
                                     "timestamp": int(timestamp),
-                                    "conditions": [str(c) for c in conditions] if conditions else [],
+                                    "conditions": [],  # CHANGED: AM.* has no conditions field
                                 }
 
                 finally:
@@ -217,5 +217,5 @@ async def connect_and_stream():
 
 
 if __name__ == "__main__":
-    logger.info("Starting Polygon WebSocket worker...")
+    logger.info("Starting Polygon WebSocket worker (AM.* minute aggregates)...")
     asyncio.run(connect_and_stream())
