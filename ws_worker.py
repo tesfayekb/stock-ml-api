@@ -26,7 +26,7 @@ logger = logging.getLogger("ws_worker")
 
 # ── Config ──
 
-POLYGON_WS_URL = "wss://socket.polygon.io/stocks"
+POLYGON_WS_URL = "wss://delayed.polygon.io/stocks"
 POLYGON_API_KEY = os.environ["POLYGON_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
