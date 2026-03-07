@@ -10,7 +10,7 @@ import pandas as pd
 
 log = logging.getLogger("ml-backend")
 
-MIN_SAMPLES = 10
+MIN_SAMPLES = 3
 MAX_WEIGHT = 4.0
 
 # Enriched feature names extracted from regime_snapshot
