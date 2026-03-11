@@ -424,24 +424,3 @@ async def connect_and_stream():
 if __name__ == "__main__":
     logger.info("Starting Tradier Options WebSocket worker (0DTE Iron Butterfly monitor)...")
     asyncio.run(connect_and_stream())
-```
-
-## Testing Locally
-
-```bash
-export TRADIER_DATA_TOKEN="your_production_token"
-export SUPABASE_URL="https://crfixmrwtzzontcsrdug.supabase.co"
-export SUPABASE_SERVICE_ROLE_KEY="your_service_role_key"
-export SUPABASE_FUNCTIONS_URL="https://crfixmrwtzzontcsrdug.supabase.co/functions/v1"
-
-python options_ws_worker.py
-```
-
-## Deployment Checklist
-
-- [ ] Railway service created with Python runtime
-- [ ] All 4 env vars configured  
-- [ ] `requirements.txt` includes `websockets httpx supabase`
-- [ ] Start command: `python options_ws_worker.py`
-- [ ] Health check: watch Railway logs for "Connected to Tradier WebSocket"
-- [ ] Verify ticks appear in Supabase `live_ticks` table with ticker `0DTE_MTM`
