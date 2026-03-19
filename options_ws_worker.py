@@ -61,14 +61,17 @@ START_TIME = time.time()
 # ── Health server (keeps Railway happy) ──
 
 async def health_handler(request):
-    """Respond to Railway health probes with 200 OK."""
+    if is_market_hours():
+        status = "streaming"
+    else:
+        status = "sleeping"
+
     return web.json_response({
-        "status": "ok",
+        "status": status,
         "service": "options-ws-worker",
         "uptime_s": round(time.time() - START_TIME),
         "market_hours": is_market_hours(),
     })
-
 
 async def start_health_server():
     """Start a lightweight HTTP server on $PORT for Railway health checks."""
