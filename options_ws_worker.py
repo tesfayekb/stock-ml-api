@@ -13,6 +13,7 @@ Key design decisions:
 - Uses SPY as real-time proxy for SPX (index data is 15-min delayed)
 - Auto-reconnects with exponential backoff
 - Only runs during market hours (9:30 AM – 4:00 PM ET)
+- Serves /health on $PORT for Railway health probes
 """
 
 import os
@@ -23,6 +24,7 @@ import time
 from datetime import datetime, timezone, timedelta
 from typing import Optional
 
+from aiohttp import web
 import httpx
 import websockets
 from supabase import create_client
@@ -31,7 +33,6 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(me
 logger = logging.getLogger("options_ws")
 
 # ── Config ──
-
 TRADIER_DATA_TOKEN = os.environ["TRADIER_DATA_TOKEN"]
 TRADIER_BASE_URL = "https://api.tradier.com"
 TRADIER_WS_URL = "wss://ws.tradier.com/v1/markets/events"
@@ -53,6 +54,33 @@ MAX_RECONNECT_DELAY = 60
 
 # ── Supabase client ──
 sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
+
+START_TIME = time.time()
+
+
+# ── Health server (keeps Railway happy) ──
+
+async def health_handler(request):
+    """Respond to Railway health probes with 200 OK."""
+    return web.json_response({
+        "status": "ok",
+        "service": "options-ws-worker",
+        "uptime_s": round(time.time() - START_TIME),
+        "market_hours": is_market_hours(),
+    })
+
+
+async def start_health_server():
+    """Start a lightweight HTTP server on $PORT for Railway health checks."""
+    app = web.Application()
+    app.router.add_get("/health", health_handler)
+    app.router.add_get("/", health_handler)  # Railway sometimes probes /
+    runner = web.AppRunner(app)
+    await runner.setup()
+    port = int(os.environ.get("PORT", 8080))
+    site = web.TCPSite(runner, "0.0.0.0", port)
+    await site.start()
+    logger.info(f"Health server listening on 0.0.0.0:{port}")
 
 
 class PositionState:
@@ -320,6 +348,9 @@ async def log_tick_stats(position: PositionState):
 
 async def connect_and_stream():
     """Main WebSocket connection loop with auto-reconnect."""
+    # Start health server FIRST so Railway gets 200 OK immediately
+    await start_health_server()
+
     reconnect_delay = 1
     
     while True:
@@ -424,3 +455,4 @@ async def connect_and_stream():
 if __name__ == "__main__":
     logger.info("Starting Tradier Options WebSocket worker (0DTE Iron Butterfly monitor)...")
     asyncio.run(connect_and_stream())
+run(connect_and_stream())
