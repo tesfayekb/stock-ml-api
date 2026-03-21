@@ -11,7 +11,7 @@ from regime_hmm import get_hmm
 import httpx
 import numpy as np
 import lightgbm as lgb
-from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
+from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sklearn.metrics import mean_squared_error
