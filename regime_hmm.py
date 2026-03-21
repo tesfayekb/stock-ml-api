@@ -151,36 +151,3 @@ _hmm = RegimeHMM()
 
 def get_hmm() -> RegimeHMM:
     return _hmm
-```
-
-## Endpoints to add in `main.py`
-
-```python
-from regime_hmm import get_hmm
-import numpy as np
-
-@app.post("/regime/train")
-async def regime_train(request: Request):
-    """Train HMM on historical feature matrix from bootstrap function."""
-    body = await request.json()
-    features = np.array(body["features"], dtype=np.float64)
-    n_states = body.get("n_states", 4)
-
-    hmm = get_hmm()
-    if n_states != hmm.n_states:
-        hmm.n_states = n_states
-        hmm.model = None
-
-    result = hmm.train(features)
-    return {"success": True, **result}
-
-
-@app.post("/regime/predict")
-async def regime_predict(request: Request):
-    """Predict current regime from feature vector."""
-    body = await request.json()
-    features = np.array(body["features"], dtype=np.float64)
-
-    hmm = get_hmm()
-    result = hmm.predict(features)
-    return {"success": True, **result}
