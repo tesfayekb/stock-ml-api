@@ -6,6 +6,7 @@ writes optimized weights back to stock_impact_profiles + calibration_state.
 import os
 import logging
 from typing import Optional
+from regime_hmm import get_hmm
 
 import httpx
 import numpy as np
@@ -14,6 +15,7 @@ from fastapi import FastAPI, HTTPException, Header, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sklearn.metrics import mean_squared_error
+
 
 from supabase_client import (
     fetch_score_deltas,
@@ -739,3 +741,30 @@ async def explain(req: ExplainRequest, authorization: Optional[str] = Header(Non
     except Exception as e:
         log.exception(f"Explain failed for {req.ticker}")
         raise HTTPException(500, str(e))
+
+
+@app.post("/regime/train")
+async def regime_train(request: Request):
+    """Train HMM on historical feature matrix from bootstrap function."""
+    body = await request.json()
+    features = np.array(body["features"], dtype=np.float64)
+    n_states = body.get("n_states", 4)
+
+    hmm = get_hmm()
+    if n_states != hmm.n_states:
+        hmm.n_states = n_states
+        hmm.model = None
+
+    result = hmm.train(features)
+    return {"success": True, **result}
+
+
+@app.post("/regime/predict")
+async def regime_predict(request: Request):
+    """Predict current regime from feature vector."""
+    body = await request.json()
+    features = np.array(body["features"], dtype=np.float64)
+
+    hmm = get_hmm()
+    result = hmm.predict(features)
+    return {"success": True, **result}
