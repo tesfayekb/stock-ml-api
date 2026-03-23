@@ -90,6 +90,7 @@ class ExplainRequest(BaseModel):
     user_id: str
     features: dict  # { event_type: contribution_value }
 
+
 class TrainIncrementalRequest(BaseModel):
     ticker: str
     user_id: str
@@ -98,6 +99,7 @@ class TrainIncrementalRequest(BaseModel):
     purge_days: int = 2
     embargo_days: int = 1
     callback_url: str | None = None
+
 
 # ═══════════════════════════════════════════════════════════════════════
 #  Async Webhook Helpers
@@ -246,7 +248,13 @@ async def _train_ensemble_and_callback(req: TrainEnsembleRequest):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    """Health check — also reports HMM model status."""
+    hmm = get_hmm()
+    return {
+        "status": "ok",
+        "hmm_loaded": hmm.model is not None,
+        "hmm_states": list(hmm.state_map.values()) if hmm.state_map else [],
+    }
 
 
 @app.post("/train")
@@ -447,6 +455,7 @@ async def train_ensemble(
     except Exception as e:
         log.exception(f"Ensemble train failed for {ticker}")
         raise HTTPException(500, str(e))
+
 
 @app.post("/train-incremental")
 async def train_incremental(
@@ -743,28 +752,72 @@ async def explain(req: ExplainRequest, authorization: Optional[str] = Header(Non
         raise HTTPException(500, str(e))
 
 
+# ═══════════════════════════════════════════════════════════════════════
+#  Regime HMM Endpoints (hardened 2026-03-23)
+# ═══════════════════════════════════════════════════════════════════════
+
 @app.post("/regime/train")
 async def regime_train(request: Request):
     """Train HMM on historical feature matrix from bootstrap function."""
-    body = await request.json()
-    features = np.array(body["features"], dtype=np.float64)
-    n_states = body.get("n_states", 4)
+    try:
+        body = await request.json()
+        features = np.array(body["features"], dtype=np.float64)
+        n_states = body.get("n_states", 4)
 
-    hmm = get_hmm()
-    if n_states != hmm.n_states:
-        hmm.n_states = n_states
-        hmm.model = None
+        log.info(f"Regime train: {features.shape[0]} samples, {features.shape[1]} features, {n_states} states")
 
-    result = hmm.train(features)
-    return {"success": True, **result}
+        hmm = get_hmm()
+        if n_states != hmm.n_states:
+            hmm.n_states = n_states
+            hmm.model = None
+
+        result = hmm.train(features)
+
+        if "error" in result:
+            log.warning(f"Regime train returned error: {result['error']}")
+            return {"success": False, **result}
+
+        log.info(f"Regime train complete: converged={result.get('converged')}, states={result.get('state_labels')}")
+        return {"success": True, **result}
+
+    except Exception as e:
+        log.exception("Regime train failed")
+        return {
+            "success": False,
+            "error": str(e),
+            "state": "normal",
+            "probabilities": {"risk_on": 25, "normal": 25, "risk_off": 25, "crisis": 25},
+            "confidence": 0.0,
+        }
 
 
 @app.post("/regime/predict")
 async def regime_predict(request: Request):
     """Predict current regime from feature vector."""
-    body = await request.json()
-    features = np.array(body["features"], dtype=np.float64)
+    try:
+        body = await request.json()
+        features = np.array(body["features"], dtype=np.float64)
 
-    hmm = get_hmm()
-    result = hmm.predict(features)
-    return {"success": True, **result}
+        log.info(f"Regime predict: features shape={features.shape}")
+
+        hmm = get_hmm()
+        result = hmm.predict(features)
+
+        # If predict returned an error (model not trained, dimension mismatch, etc.)
+        # still return 200 with the safe fallback — never 500
+        if "error" in result:
+            log.warning(f"Regime predict soft error: {result['error']}")
+            return {"success": False, **result}
+
+        return {"success": True, **result}
+
+    except Exception as e:
+        log.exception("Regime predict failed")
+        # Return safe fallback instead of 500
+        return {
+            "success": False,
+            "error": str(e),
+            "state": "normal",
+            "probabilities": {"risk_on": 25, "normal": 25, "risk_off": 25, "crisis": 25},
+            "confidence": 0.0,
+        }
