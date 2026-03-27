@@ -1,7 +1,7 @@
 """
 Polygon.io WebSocket → Supabase live_ticks worker.
 
-Connects to Polygon's Stocks WebSocket, subscribes to minute aggregate events (AM.*),
+Connects to Polygon's Stocks WebSocket, subscribes to real-time trade events (T.*),
 and upserts price ticks to Supabase for Realtime broadcast to the frontend.
 
 Key design decisions:
@@ -9,6 +9,7 @@ Key design decisions:
 - Deduplicates: only keeps latest tick per ticker per batch
 - Auto-reconnects on disconnect with exponential backoff
 - Dynamically updates subscriptions from scan_candidates if WATCHED_TICKERS=DYNAMIC
+- T.* fires on every trade; the 1s buffer + dedup keeps Supabase load manageable
 """
 
 import os
@@ -26,21 +27,22 @@ logger = logging.getLogger("ws_worker")
 
 # ── Config ──
 
-POLYGON_WS_URL = "wss://delayed.polygon.io/stocks"
+POLYGON_WS_URL = "wss://socket.polygon.io/stocks"
 POLYGON_API_KEY = os.environ["POLYGON_API_KEY"]
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_SERVICE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
-BATCH_INTERVAL_SECONDS = 1.0
-MAX_BATCH_SIZE = 200
-TICKER_REFRESH_INTERVAL = 300
-MAX_RECONNECT_DELAY = 60
+BATCH_INTERVAL_SECONDS = 1.0  # Flush ticks to Supabase every N seconds
+MAX_BATCH_SIZE = 200          # Max rows per insert batch
+TICKER_REFRESH_INTERVAL = 300 # Re-fetch dynamic tickers every 5 minutes
+MAX_RECONNECT_DELAY = 60      # Max backoff delay in seconds
 
 # ── Supabase client ──
 
 sb = create_client(SUPABASE_URL, SUPABASE_SERVICE_KEY)
 
 # ── Tick buffer ──
+# Dict[ticker, latest_tick_data] — only latest per ticker per flush
 tick_buffer: dict[str, dict] = {}
 buffer_lock = asyncio.Lock()
 
@@ -51,6 +53,7 @@ def get_watched_tickers() -> list[str]:
     if raw != "DYNAMIC":
         return [t.strip().upper() for t in raw.split(",") if t.strip()]
 
+    # Dynamic: fetch active scan candidates + any tickers with open signals
     try:
         candidates = (
             sb.table("scan_candidates")
@@ -70,6 +73,7 @@ def get_watched_tickers() -> list[str]:
         for row in (signals.data or []):
             tickers.add(row["ticker"])
 
+        # Always include core indices
         tickers.update(["SPY", "QQQ", "IWM", "DIA"])
 
         result = sorted(tickers)
@@ -91,6 +95,7 @@ async def flush_buffer():
     if not rows:
         return
 
+    # Batch insert
     for i in range(0, len(rows), MAX_BATCH_SIZE):
         batch = rows[i : i + MAX_BATCH_SIZE]
         try:
@@ -119,7 +124,7 @@ async def ticker_refresher(ws, current_tickers: set):
             if to_add:
                 sub_msg = json.dumps({
                     "action": "subscribe",
-                    "params": ",".join(f"AM.{t}" for t in to_add)  # CHANGED: T.* → AM.*
+                    "params": ",".join(f"T.{t}" for t in to_add)
                 })
                 await ws.send(sub_msg)
                 logger.info(f"Subscribed to {len(to_add)} new tickers: {sorted(to_add)[:10]}...")
@@ -128,7 +133,7 @@ async def ticker_refresher(ws, current_tickers: set):
             if to_remove:
                 unsub_msg = json.dumps({
                     "action": "unsubscribe",
-                    "params": ",".join(f"AM.{t}" for t in to_remove)  # CHANGED: T.* → AM.*
+                    "params": ",".join(f"T.{t}" for t in to_remove)
                 })
                 await ws.send(unsub_msg)
                 logger.info(f"Unsubscribed from {len(to_remove)} tickers")
@@ -146,12 +151,14 @@ async def connect_and_stream():
         try:
             async with websockets.connect(POLYGON_WS_URL) as ws:
                 logger.info("Connected to Polygon WebSocket")
-                reconnect_delay = 1
+                reconnect_delay = 1  # Reset on successful connect
 
+                # Wait for connection message
                 msg = await ws.recv()
                 data = json.loads(msg)
                 logger.info(f"Connection message: {data}")
 
+                # Authenticate
                 auth_msg = json.dumps({"action": "auth", "params": POLYGON_API_KEY})
                 await ws.send(auth_msg)
                 auth_resp = await ws.recv()
@@ -163,14 +170,15 @@ async def connect_and_stream():
                     await asyncio.sleep(10)
                     continue
 
-                # CHANGED: Subscribe to minute aggregates instead of trades
+                # Subscribe to real-time trade events
                 tickers = get_watched_tickers()
                 current_tickers = set(tickers)
-                sub_params = ",".join(f"AM.{t}" for t in tickers)  # CHANGED: T.* → AM.*
+                sub_params = ",".join(f"T.{t}" for t in tickers)
                 sub_msg = json.dumps({"action": "subscribe", "params": sub_params})
                 await ws.send(sub_msg)
-                logger.info(f"Subscribed to {len(tickers)} tickers (AM.* minute aggregates)")
+                logger.info(f"Subscribed to {len(tickers)} tickers (T.* real-time trades)")
 
+                # Start background tasks
                 flusher_task = asyncio.create_task(buffer_flusher())
                 refresher_task = asyncio.create_task(ticker_refresher(ws, current_tickers))
 
@@ -182,31 +190,34 @@ async def connect_and_stream():
 
                         for event in events:
                             ev_type = event.get("ev")
-
-                            if ev_type != "AM":   # CHANGED: was "T"
-                                logger.info(f"Non-AM event: {event}")
-                                continue
+                            if ev_type != "T":
+                                continue  # Only process real-time trade events
 
                             ticker = event.get("sym", "")
-                            price = event.get("c", 0)  # CHANGED: minute close (was "p" trade price)
-                            size = event.get("v", 0)   # CHANGED: aggregate volume (was "s" trade size)
-                            timestamp = event.get("e", 0)  # CHANGED: end timestamp (was "t")
+                            price = event.get("p", 0)      # trade price
+                            size = event.get("s", 0)       # trade size (shares)
+                            timestamp = event.get("t", 0)  # SIP timestamp (nanoseconds)
 
                             if not ticker or not price:
                                 continue
 
+                            # Convert nanoseconds → milliseconds for consistency
+                            timestamp_ms = timestamp // 1_000_000 if timestamp > 1e15 else timestamp
+
+                            # Buffer: keep only latest tick per ticker
                             async with buffer_lock:
                                 tick_buffer[ticker] = {
                                     "ticker": ticker,
                                     "price": float(price),
                                     "size": int(size),
-                                    "timestamp": int(timestamp),
-                                    "conditions": [],  # CHANGED: AM.* has no conditions field
+                                    "timestamp": int(timestamp_ms),
+                                    "conditions": ["REALTIME_TRADE"],
                                 }
 
                 finally:
                     flusher_task.cancel()
                     refresher_task.cancel()
+                    # Final flush
                     await flush_buffer()
 
         except websockets.ConnectionClosed as e:
@@ -219,5 +230,5 @@ async def connect_and_stream():
 
 
 if __name__ == "__main__":
-    logger.info("Starting Polygon WebSocket worker (AM.* minute aggregates)...")
+    logger.info("Starting Polygon WebSocket worker (T.* real-time trades)...")
     asyncio.run(connect_and_stream())
