@@ -7,6 +7,7 @@ import os
 import logging
 from typing import Optional
 from regime_hmm import get_hmm
+from tactical_model import get_tactical_model, TacticalModel
 
 import httpx
 import numpy as np
@@ -64,6 +65,15 @@ class TrainRequest(BaseModel):
     lookback_days: int = 365
     purge_days: int = 2
     embargo_days: int = 1
+    callback_url: str | None = None
+    
+class TacticalPredictRequest(BaseModel):
+    user_id: str
+    features: dict  # latest fast_features.features jsonb
+
+class TacticalTrainRequest(BaseModel):
+    user_id: str
+    lookback_days: int = 90
     callback_url: str | None = None
 
 
@@ -248,12 +258,15 @@ async def _train_ensemble_and_callback(req: TrainEnsembleRequest):
 
 @app.get("/health")
 def health():
-    """Health check — also reports HMM model status."""
     hmm = get_hmm()
+    tactical = get_tactical_model()
     return {
         "status": "ok",
         "hmm_loaded": hmm.model is not None,
         "hmm_states": list(hmm.state_map.values()) if hmm.state_map else [],
+        "tactical_trained": tactical.is_trained,
+        "tactical_samples": tactical.training_samples,
+        "tactical_last_trained": tactical.last_trained_at,
     }
 
 
@@ -418,6 +431,65 @@ async def train(req: TrainRequest, authorization: Optional[str] = Header(None)):
 
     except Exception as e:
         log.exception(f"Train failed for {ticker}")
+        raise HTTPException(500, str(e))
+
+@app.post("/predict-tactical")
+async def predict_tactical(req: TacticalPredictRequest, authorization: Optional[str] = Header(None)):
+    """Predict 24h market direction + magnitude from fast_features."""
+    verify_caller(authorization)
+    try:
+        model = get_tactical_model()
+        result = model.predict(req.features)
+        result["user_id"] = req.user_id
+        return result
+    except Exception as e:
+        log.exception("Tactical predict failed")
+        return {
+            "success": False,
+            "error": str(e),
+            "direction": "flat",
+            "direction_confidence": 0.33,
+            "magnitude_estimate": 0.0,
+            "model_version": "tactical-v1",
+        }
+
+
+@app.post("/train-tactical")
+async def train_tactical(
+    req: TacticalTrainRequest,
+    background_tasks: BackgroundTasks,
+    authorization: Optional[str] = Header(None),
+):
+    """Train tactical model on labeled fast_features data."""
+    verify_caller(authorization)
+    log.info(f"Tactical train request: user={req.user_id[:8]}..., lookback={req.lookback_days}d")
+
+    try:
+        model = get_tactical_model()
+        result = model.train(req.user_id, req.lookback_days)
+
+        if req.callback_url:
+            await _send_callback(req.callback_url, {
+                **result,
+                "model_type": "tactical_lgbm",
+                "user_id": req.user_id,
+                "ticker": "SPY",  # tactical model is market-level
+                "success": result.get("status") == "trained",
+            })
+            return {"accepted": True, "status": result["status"]}
+
+        return result
+    except Exception as e:
+        log.exception("Tactical train failed")
+        error_result = {
+            "success": False,
+            "error": str(e),
+            "user_id": req.user_id,
+            "model_type": "tactical_lgbm",
+        }
+        if req.callback_url:
+            await _send_callback(req.callback_url, error_result)
+            return {"accepted": True, "status": "error"}
         raise HTTPException(500, str(e))
 
 
