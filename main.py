@@ -256,7 +256,7 @@ async def _train_ensemble_and_callback(req: TrainEnsembleRequest):
 # ═══════════════════════════════════════════════════════════════════════
 #  Endpoints
 # ═══════════════════════════════════════════════════════════════════════
-
+@app.get("/health")
 def health():
     hmm = get_hmm()
     tactical = get_tactical_model()       # 24h
