@@ -84,8 +84,12 @@ TIMING_FEATURE_KEYS = [
     "correlation_spike", "liquidity_score",
 ]
 
-# v4: Path features fed INTO direction model (not separate)
-PATH_FEATURE_KEYS = ["path_type_trend", "path_type_reversal", "path_type_chop"]
+# v5: Path + continuation/reversal features fed INTO direction model
+PATH_FEATURE_KEYS = [
+    "_path_type",             # from edge function (last known path)
+    "_continuation_prob",     # from edge function
+    "_reversal_prob",         # from edge function
+]
 
 ALL_FEATURE_KEYS = CONTEXT_FEATURE_KEYS + TIMING_FEATURE_KEYS
 
@@ -231,7 +235,17 @@ class TacticalModel2h:
             # Build separate feature vectors for context and timing
             context_row = [features.get(k, 0) or 0 for k in CONTEXT_FEATURE_KEYS]
             timing_row = [features.get(k, 0) or 0 for k in TIMING_FEATURE_KEYS]
-            full_row = context_row + timing_row
+            
+            # v5: Append path features INTO timing (direction model sees path context)
+            cont_prob = label.get("continuation_probability") or 0.5
+            rev_prob = label.get("reversal_probability") or 0.5
+            path = label.get("path_type", "chop")
+            path_one_hot = [1 if path == "trend" else 0, 1 if path == "reversal" else 0, 1 if path == "chop" else 0]
+            timing_row_with_path = timing_row + [cont_prob, rev_prob] + path_one_hot
+            
+            full_row = context_row + timing_row_with_path
+            full_row.append(feat.get("spy_price") or 0)
+            full_row.append(vix)
             full_row.append(feat.get("spy_price") or 0)
             full_row.append(vix)
 
@@ -259,7 +273,7 @@ class TacticalModel2h:
 
             records.append({
                 "context": context_row,
-                "timing": timing_row,
+                "timing": timing_row_with_path,  # v5: includes path features
                 "full": full_row,
                 "y_dir": y_dir,
                 "y_mag": y_mag,
@@ -295,9 +309,18 @@ class TacticalModel2h:
                 "model_version": MODEL_VERSION,
             }
 
-        log.info(f"2h v2 training: {len(records)} samples")
-        feature_names = ALL_FEATURE_KEYS + ["spy_price", "vix_level"]
+        log.info(f"2h v3 training: {len(records)} samples")
+        feature_names = ALL_FEATURE_KEYS + PATH_FEATURE_KEYS + ["cont_prob", "rev_prob"] + ["spy_price", "vix_level"]
         self.feature_names = feature_names
+        
+        # v5: Set adaptive context/timing weight based on sample count
+        n = len(records)
+        if n < 200:
+            self._context_weight = 0.5  # equal weight — small data safety
+        elif n < 500:
+            self._context_weight = 0.35
+        else:
+            self._context_weight = 0.2  # full 20/80 at scale
 
         # Prepare arrays
         X_context = np.array([r["context"] for r in records], dtype=np.float64)
@@ -390,13 +413,13 @@ class TacticalModel2h:
             self.path_classifier.fit(X_full[:split_idx], y_path[:split_idx])
 
         # ─── 4. Validation ───
-        # Combined prediction on validation set
+        # Combined prediction on validation set with adaptive weights
+        cw = self._context_weight
         ctx_probs_val = self.context_classifier.predict_proba(X_context[split_idx:])
         timing_model, _, _ = self.timing_classifier.get_model(20)  # use global for overall eval
         timing_probs_val = timing_model.predict_proba(X_timing[split_idx:])
 
-        # Weighted combination: 20% context + 80% timing
-        combined_probs = 0.2 * ctx_probs_val + 0.8 * timing_probs_val
+        combined_probs = cw * ctx_probs_val + (1 - cw) * timing_probs_val
         combined_preds = np.argmax(combined_probs, axis=1)
         dir_accuracy = float(accuracy_score(y_dir[split_idx:], combined_preds))
 
@@ -404,18 +427,20 @@ class TacticalModel2h:
         ctx_mag_val = self.context_regressor.predict(X_context[split_idx:])
         timing_reg_model, _, _ = self.timing_regressor.get_model(20)
         timing_mag_val = timing_reg_model.predict(X_timing[split_idx:])
-        combined_mag = 0.2 * ctx_mag_val + 0.8 * timing_mag_val
+        combined_mag = cw * ctx_mag_val + (1 - cw) * timing_mag_val
         mag_corr = float(np.corrcoef(combined_mag, y_mag[split_idx:])[0, 1])
         if np.isnan(mag_corr):
             mag_corr = 0.0
 
-        # ─── 5. Isotonic Calibration ───
-        # Fit isotonic regression: max predicted prob → actual accuracy
+        # ─── 5. Global-Only Isotonic Calibration ───
+        # v5: Skip per-regime calibration until 300+ samples (too noisy at small N)
         max_probs_val = np.max(combined_probs, axis=1)
         correct_val = (combined_preds == y_dir[split_idx:]).astype(float)
-        if len(max_probs_val) >= 20:
+        if len(max_probs_val) >= 30:  # raised from 20 — need more for reliable calibration
             self.calibrator = IsotonicRegression(y_min=0, y_max=1, out_of_bounds="clip")
             self.calibrator.fit(max_probs_val, correct_val)
+        else:
+            self.calibrator = None  # don't calibrate with too few samples
 
         # Store metadata
         self.training_samples = len(records)
@@ -461,42 +486,52 @@ class TacticalModel2h:
         # Build feature vectors
         context_row = [features.get(k, 0) or 0 for k in CONTEXT_FEATURE_KEYS]
         timing_row = [features.get(k, 0) or 0 for k in TIMING_FEATURE_KEYS]
-        full_row = context_row + timing_row + [
+        
+        # v5: Append path context into timing features (direction model sees path)
+        cont_prob = features.get("_continuation_prob") or 0.5
+        rev_prob = features.get("_reversal_prob") or 0.5
+        path_type = features.get("_path_type", "chop")
+        path_one_hot = [1 if path_type == "trend" else 0, 1 if path_type == "reversal" else 0, 1 if path_type == "chop" else 0]
+        timing_row_with_path = timing_row + [cont_prob, rev_prob] + path_one_hot
+        
+        full_row = context_row + timing_row_with_path + [
             features.get("spy_price", 0) or 0,
             vix,
         ]
 
         X_ctx = np.nan_to_num(np.array([context_row], dtype=np.float64))
-        X_tim = np.nan_to_num(np.array([timing_row], dtype=np.float64))
+        X_tim = np.nan_to_num(np.array([timing_row_with_path], dtype=np.float64))
         X_full = np.nan_to_num(np.array([full_row], dtype=np.float64))
 
-        # Context prediction (20% weight)
+        # Context prediction (adaptive weight)
         ctx_probs = self.context_classifier.predict_proba(X_ctx)[0]
         ctx_mag = float(self.context_regressor.predict(X_ctx)[0])
 
-        # Timing prediction (80% weight, regime-gated)
+        # Timing prediction (regime-gated)
         timing_clf, regime_used, is_fallback = self.timing_classifier.get_model(vix)
         timing_reg, _, _ = self.timing_regressor.get_model(vix)
 
         timing_probs = timing_clf.predict_proba(X_tim)[0]
         timing_mag = float(timing_reg.predict(X_tim)[0])
 
-        # Weighted combination
-        combined_probs = 0.2 * ctx_probs + 0.8 * timing_probs
+        # Adaptive weighted combination: 50/50 at low samples, 20/80 at 500+
+        cw = self._context_weight
+        combined_probs = cw * ctx_probs + (1 - cw) * timing_probs
         dir_pred = int(np.argmax(combined_probs))
         direction_map = {0: "down", 1: "flat", 2: "up"}
         direction = direction_map[dir_pred]
         direction_confidence = float(combined_probs[dir_pred])
 
-        # Calibrate confidence with isotonic regression
+        # v5: Global-only isotonic calibration (skip per-regime until 300+ samples)
         calibrated_confidence = direction_confidence
         if self.calibrator is not None:
             calibrated_confidence = float(
                 self.calibrator.predict([direction_confidence])[0]
             )
 
-        # Abstain mode: use calibrated confidence
-        if calibrated_confidence < 0.45:
+        # v5: Dynamic abstain threshold based on VIX (passed from edge function)
+        conf_threshold = features.get("_confidence_threshold", 0.45)
+        if calibrated_confidence < conf_threshold:
             direction = "abstain"
 
         # Combined magnitude
