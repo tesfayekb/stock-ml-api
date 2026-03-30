@@ -1,12 +1,16 @@
 """
-Tactical 2h Forecast Model v2 — Elite Architecture
+Tactical 2h Forecast Model v3 — Elite Architecture
 ====================================================
-Major upgrades from v1:
-1. Context/Timing model split (20/80 weight)
-2. Regime-gated model routing (low/mid/high vol)
-3. Triple barrier labeling support
-4. Explicit continuation/reversal classifier
-5. Session-aware prediction adjustments
+Major upgrades from v2:
+1. Feature velocity (2nd derivatives): delta_return, delta_vwap, delta_vol
+2. Path_type fed INTO direction model (not separate)
+3. Multi-factor intraday regime (trend/chop/mean_reversion/liquidity_vacuum)
+4. Opportunity detection split: Model A (is there a move?) + Model B (which direction?)
+5. Meta-labeling: secondary model filters bad trades
+6. Ensemble diversity: LightGBM + LogisticRegression + MLP
+7. Temporal weighting: recent features weighted higher (exponential decay)
+8. Smarter abstain: model disagreement, regime uncertainty, low velocity
+9. Adaptive context/timing weight: 50/50 at <200 samples, 20/80 at 500+
 
 COMPLETELY INDEPENDENT from the 24h tactical model (tactical_model.py).
 """
@@ -16,6 +20,8 @@ import numpy as np
 import lightgbm as lgb
 from sklearn.metrics import accuracy_score
 from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
 from supabase import create_client
 from datetime import datetime, timedelta
 
@@ -24,8 +30,8 @@ log = logging.getLogger("tactical-model-2h")
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
-MIN_TACTICAL_2H_SAMPLES = 150
-MODEL_VERSION = "tactical-2h-v2"
+MIN_TACTICAL_2H_SAMPLES = 100  # Reduced from 150 — right-sized for current data
+MODEL_VERSION = "tactical-2h-v3"
 
 # ─── Feature Groups ──────────────────────────────────────────────────────
 
@@ -45,7 +51,7 @@ CONTEXT_FEATURE_KEYS = [
     "net_premium_flow", "iv_rank_spy",
 ]
 
-# Timing features: intraday microstructure (80% weight in final prediction)
+# Timing features: intraday microstructure (weight scales with sample count)
 TIMING_FEATURE_KEYS = [
     # Price action
     "spy_return_from_open", "spy_return_5m", "spy_return_15m",
@@ -53,6 +59,12 @@ TIMING_FEATURE_KEYS = [
     "spy_vwap_distance", "intraday_range_pct",
     "distance_from_intraday_high", "distance_from_intraday_low",
     "return_acceleration",  # 2nd derivative: (ret_5m - ret_15m)
+    # v4: Feature velocity (2nd derivatives) — "is momentum accelerating?"
+    "delta_return_5m",           # Δ(return_5m) — acceleration of 5m returns
+    "delta_vwap_distance",       # Δ(vwap_distance) — price accelerating toward/away VWAP
+    "delta_volume_delta",        # Δ(volume_delta) — flow acceleration
+    "delta_vol_expansion",       # Δ(vol_expansion_rate) — vol regime shifting
+    "momentum_acceleration",     # 3rd derivative proxy
     # Volume/flow
     "volume_delta_15m", "volume_imbalance_5m",
     "volatility_expansion_rate", "tick_volume_ratio",
@@ -68,7 +80,12 @@ TIMING_FEATURE_KEYS = [
     "vwap_x_momentum", "vol_x_breadth",
     # Realized vol
     "realized_vol_proxy", "spy_intraday_range",
+    # v4: Intraday regime features
+    "correlation_spike", "liquidity_score",
 ]
+
+# v4: Path features fed INTO direction model (not separate)
+PATH_FEATURE_KEYS = ["path_type_trend", "path_type_reversal", "path_type_chop"]
 
 ALL_FEATURE_KEYS = CONTEXT_FEATURE_KEYS + TIMING_FEATURE_KEYS
 
@@ -111,38 +128,40 @@ class RegimeGatedModel:
 
 class TacticalModel2h:
     """
-    v2 Architecture:
+    v3 Architecture:
     ┌──────────────────────────────────────────────┐
-    │ Context Model (20% weight)                    │
-    │  - VIX, credit, rates, macro, GEX, P/C      │
-    │  - Regime probabilities, event proximity      │
+    │ Model A: Opportunity Detector                 │
+    │  "Is there a tradable move in next 2h?"      │
+    │  Binary: tradable (1) vs no-trade (0)        │
     ├──────────────────────────────────────────────┤
-    │ Timing Model (80% weight)                     │
-    │  - Intraday returns (5m, 15m, 30m, 60m)      │
-    │  - VWAP positioning + slope                   │
-    │  - Volume delta / imbalance                   │
-    │  - Volatility expansion rate                  │
-    │  - Flow imbalance                             │
+    │ Model B: Direction Predictor (only if A=1)    │
+    │  Context (adaptive weight) + Timing (adaptive)│
+    │  + Path features fed IN as inputs             │
     ├──────────────────────────────────────────────┤
     │ Regime Gating: separate models per VIX bucket │
-    │  - Low (<18), Mid (18-25), High (>25)        │
+    │  + multi-factor intraday regime input         │
     ├──────────────────────────────────────────────┤
-    │ Continuation/Reversal Classifier              │
-    │  - Explicit {continuation, reversal, chop}    │
+    │ Meta-Model: should we trust this prediction?  │
+    │  Filters bad trades post-prediction           │
     ├──────────────────────────────────────────────┤
-    │ Triple Barrier Label Support                  │
-    │  - {hit_upper, hit_lower, timeout}            │
+    │ Ensemble: LightGBM + LogReg + MLP (majority) │
     └──────────────────────────────────────────────┘
     """
 
     def __init__(self):
-        # Context model (macro-heavy)
+        # Model A: Opportunity detector (is there a 2h move?)
+        self.opportunity_detector = None
+        # Model B: Direction predictor
         self.context_classifier = None
         self.context_regressor = None
-        # Timing model (intraday-heavy, regime-gated)
         self.timing_classifier = RegimeGatedModel()
         self.timing_regressor = RegimeGatedModel()
-        # Continuation/reversal classifier
+        # Ensemble diversity: additional models
+        self.logreg_classifier = None  # LogisticRegression
+        self.mlp_classifier = None     # MLPClassifier
+        # Meta-labeler: "should we trade this?"
+        self.meta_model = None
+        # Path classifier (also feeds into direction)
         self.path_classifier = None
         # Calibration
         self.calibrator = None  # IsotonicRegression
@@ -153,6 +172,8 @@ class TacticalModel2h:
         self.cv_direction_accuracy = 0.0
         self.cv_magnitude_corr = 0.0
         self.regime_accuracies = {}
+        # Adaptive weights based on sample count
+        self._context_weight = 0.5  # starts 50/50, moves to 20/80 with data
 
     @property
     def is_trained(self):
