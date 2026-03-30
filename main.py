@@ -7,7 +7,7 @@ import os
 import logging
 from typing import Optional
 from regime_hmm import get_hmm
-from tactical_model import get_tactical_model_24h, TacticalModel24h
+from tactical_model import get_tactical_model_24h, TacticalModel24h  # v2: was get_tactical_model
 from tactical_model_2h import get_tactical_model_2h, TacticalModel2h
 
 import httpx
@@ -109,6 +109,18 @@ class TrainIncrementalRequest(BaseModel):
     new_data_hours: int = 48      # only train on recent data
     purge_days: int = 2
     embargo_days: int = 1
+    callback_url: str | None = None
+
+
+class TacticalPredict2hRequest(BaseModel):
+    user_id: str
+    features: dict    # latest fast_features.features jsonb (v2 with intraday keys)
+    horizon: str = "2h"
+
+
+class TacticalTrain2hRequest(BaseModel):
+    user_id: str
+    lookback_days: int = 60
     callback_url: str | None = None
 
 
@@ -256,12 +268,13 @@ async def _train_ensemble_and_callback(req: TrainEnsembleRequest):
 # ═══════════════════════════════════════════════════════════════════════
 #  Endpoints
 # ═══════════════════════════════════════════════════════════════════════
+
 @app.get("/health")
 def health():
     """Health check — reports HMM + tactical model status."""
     hmm = get_hmm()
-    tactical_24h = get_tactical_model_24h()
-    tactical_2h = get_tactical_model_2h()
+    tactical_24h = get_tactical_model_24h()   # v2
+    tactical_2h = get_tactical_model_2h()     # 2h
     return {
         "status": "ok",
         # HMM
@@ -274,7 +287,7 @@ def health():
         "tactical_24h_cv_accuracy": tactical_24h.cv_direction_accuracy,
         "tactical_24h_cv_ridge_accuracy": tactical_24h.cv_ridge_accuracy,
         "tactical_24h_cv_magnitude_corr": tactical_24h.cv_magnitude_corr,
-        "tactical_24h_model_version": MODEL_VERSION,
+        "tactical_24h_model_version": "tactical-24h-v2",
         # 2h tactical
         "tactical_2h_trained": tactical_2h.is_trained,
         "tactical_2h_samples": tactical_2h.training_samples,
@@ -445,6 +458,11 @@ async def train(req: TrainRequest, authorization: Optional[str] = Header(None)):
     except Exception as e:
         log.exception(f"Train failed for {ticker}")
         raise HTTPException(500, str(e))
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Tactical 24h Endpoints
+# ═══════════════════════════════════════════════════════════════════════
 
 @app.post("/predict-tactical")
 async def predict_tactical(req: TacticalPredictRequest, authorization: Optional[str] = Header(None)):
@@ -837,27 +855,10 @@ async def explain(req: ExplainRequest, authorization: Optional[str] = Header(Non
         log.exception(f"Explain failed for {req.ticker}")
         raise HTTPException(500, str(e))
 
+
 # ═══════════════════════════════════════════════════════════════════════
 #  2h Tactical Forecast Endpoints (Regime v6 Phase 3)
 # ═══════════════════════════════════════════════════════════════════════
-
-# Add import at top of main.py:
-from tactical_model_2h import get_tactical_model_2h, TacticalModel2h
-
-# Add request models (can reuse TacticalPredictRequest, or add horizon field):
-class TacticalPredict2hRequest(BaseModel):
-    user_id: str
-    features: dict    # latest fast_features.features jsonb (v2 with intraday keys)
-    horizon: str = "2h"  # always "2h" for this endpoint
-
-
-class TacticalTrain2hRequest(BaseModel):
-    user_id: str
-    lookback_days: int = 60   # shorter default than 24h (90)
-    callback_url: str | None = None
-
-
-# ─── Predict 2h ───
 
 @app.post("/predict-tactical-2h")
 async def predict_tactical_2h(
@@ -866,11 +867,7 @@ async def predict_tactical_2h(
 ):
     """
     Predict 2h market direction + magnitude from v2 fast_features.
-    
     Returns direction, confidence, magnitude, continuation/reversal probs.
-    Returns {"status": "not_trained"} if model hasn't been trained yet.
-    
-    This is COMPLETELY INDEPENDENT from /predict-tactical (24h).
     """
     verify_caller(authorization)
     try:
@@ -890,8 +887,6 @@ async def predict_tactical_2h(
         }
 
 
-# ─── Train 2h ───
-
 @app.post("/train-tactical-2h")
 async def train_tactical_2h(
     req: TacticalTrain2hRequest,
@@ -900,11 +895,7 @@ async def train_tactical_2h(
 ):
     """
     Train 2h tactical model on labeled_2h fast_features data.
-    
     Requires MIN_TACTICAL_2H_SAMPLES (150) labeled 2h snapshots.
-    Uses v2 intraday features (session_hour, spy_return_5m/15m/30m, etc.)
-    
-    This is COMPLETELY INDEPENDENT from /train-tactical (24h).
     """
     verify_caller(authorization)
     log.info(f"2h Tactical train request: user={req.user_id[:8]}..., lookback={req.lookback_days}d")
@@ -936,7 +927,6 @@ async def train_tactical_2h(
             await _send_callback(req.callback_url, error_result)
             return {"accepted": True, "status": "error"}
         raise HTTPException(500, str(e))
-
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -990,8 +980,6 @@ async def regime_predict(request: Request):
         hmm = get_hmm()
         result = hmm.predict(features)
 
-        # If predict returned an error (model not trained, dimension mismatch, etc.)
-        # still return 200 with the safe fallback — never 500
         if "error" in result:
             log.warning(f"Regime predict soft error: {result['error']}")
             return {"success": False, **result}
@@ -1000,7 +988,6 @@ async def regime_predict(request: Request):
 
     except Exception as e:
         log.exception("Regime predict failed")
-        # Return safe fallback instead of 500
         return {
             "success": False,
             "error": str(e),
