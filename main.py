@@ -7,7 +7,7 @@ import os
 import logging
 from typing import Optional
 from regime_hmm import get_hmm
-from tactical_model import get_tactical_model, TacticalModel
+from tactical_model import get_tactical_model_24h, TacticalModel24h
 from tactical_model_2h import get_tactical_model_2h, TacticalModel2h
 
 import httpx
@@ -258,19 +258,24 @@ async def _train_ensemble_and_callback(req: TrainEnsembleRequest):
 # ═══════════════════════════════════════════════════════════════════════
 @app.get("/health")
 def health():
+    """Health check — reports HMM + tactical model status."""
     hmm = get_hmm()
-    tactical = get_tactical_model()       # 24h
-    tactical_2h = get_tactical_model_2h() # 2h — NEW
+    tactical_24h = get_tactical_model_24h()
+    tactical_2h = get_tactical_model_2h()
     return {
         "status": "ok",
         # HMM
         "hmm_loaded": hmm.model is not None,
         "hmm_states": list(hmm.state_map.values()) if hmm.state_map else [],
-        # 24h tactical
-        "tactical_trained": tactical.is_trained,
-        "tactical_samples": tactical.training_samples,
-        "tactical_last_trained": tactical.last_trained_at,
-        # 2h tactical — NEW
+        # 24h tactical (v2)
+        "tactical_24h_trained": tactical_24h.is_trained,
+        "tactical_24h_samples": tactical_24h.training_samples,
+        "tactical_24h_last_trained": tactical_24h.last_trained_at,
+        "tactical_24h_cv_accuracy": tactical_24h.cv_direction_accuracy,
+        "tactical_24h_cv_ridge_accuracy": tactical_24h.cv_ridge_accuracy,
+        "tactical_24h_cv_magnitude_corr": tactical_24h.cv_magnitude_corr,
+        "tactical_24h_model_version": MODEL_VERSION,
+        # 2h tactical
         "tactical_2h_trained": tactical_2h.is_trained,
         "tactical_2h_samples": tactical_2h.training_samples,
         "tactical_2h_last_trained": tactical_2h.last_trained_at,
@@ -443,22 +448,23 @@ async def train(req: TrainRequest, authorization: Optional[str] = Header(None)):
 
 @app.post("/predict-tactical")
 async def predict_tactical(req: TacticalPredictRequest, authorization: Optional[str] = Header(None)):
-    """Predict 24h market direction + magnitude from fast_features."""
+    """Predict 24h market direction + magnitude (v2: decision layer + canonical schema)."""
     verify_caller(authorization)
     try:
-        model = get_tactical_model()
+        model = get_tactical_model_24h()
         result = model.predict(req.features)
         result["user_id"] = req.user_id
         return result
     except Exception as e:
-        log.exception("Tactical predict failed")
+        log.exception("Tactical-24h predict failed")
         return {
             "success": False,
             "error": str(e),
-            "direction": "flat",
-            "direction_confidence": 0.33,
+            "direction": "abstain",
+            "direction_confidence": 0.0,
             "magnitude_estimate": 0.0,
-            "model_version": "tactical-v1",
+            "model_version": "tactical-24h-v2",
+            "decision_layer": {"abstain": True, "abstain_reason": f"exception: {str(e)}"},
         }
 
 
@@ -468,32 +474,32 @@ async def train_tactical(
     background_tasks: BackgroundTasks,
     authorization: Optional[str] = Header(None),
 ):
-    """Train tactical model on labeled fast_features data."""
+    """Train 24h tactical model (v2: binary + ridge + canonical schema)."""
     verify_caller(authorization)
-    log.info(f"Tactical train request: user={req.user_id[:8]}..., lookback={req.lookback_days}d")
+    log.info(f"Tactical-24h train: user={req.user_id[:8]}..., lookback={req.lookback_days}d")
 
     try:
-        model = get_tactical_model()
+        model = get_tactical_model_24h()
         result = model.train(req.user_id, req.lookback_days)
 
         if req.callback_url:
             await _send_callback(req.callback_url, {
                 **result,
-                "model_type": "tactical_lgbm",
+                "model_type": "tactical_24h_lgbm_v2",
                 "user_id": req.user_id,
-                "ticker": "SPY",  # tactical model is market-level
+                "ticker": "SPY",
                 "success": result.get("status") == "trained",
             })
             return {"accepted": True, "status": result["status"]}
 
         return result
     except Exception as e:
-        log.exception("Tactical train failed")
+        log.exception("Tactical-24h train failed")
         error_result = {
             "success": False,
             "error": str(e),
             "user_id": req.user_id,
-            "model_type": "tactical_lgbm",
+            "model_type": "tactical_24h_lgbm_v2",
         }
         if req.callback_url:
             await _send_callback(req.callback_url, error_result)
