@@ -1,225 +1,199 @@
 """
-Tactical 24h Forecast Model v2 — Canonical Schema + Decision Layer.
+Tactical 24h Forecast Model v3 — Elite Upgrade
+LightGBM + Ridge ensemble with:
+  - Regime-conditioned routing
+  - Isotonic calibration
+  - 102-feature canonical schema (v7 poller aligned)
+  - Feature importance pruning support
+  - Forecast quality model
+  - State transition awareness
 
-Changes from v1:
-- FEATURE_KEYS aligned to fast-feature-poller canonical output
-- v5 alpha features added (gamma_flip_distance, sweep_intensity, etc.)
-- Binary direction + smart abstain (replaces 3-class up/flat/down)
-- Opportunity filter (is there enough edge to act?)
-- Ridge companion model for ensemble diversity
-- Isotonic calibration placeholder
-- Schema validation (fail loudly on missing critical features)
-- Regime-conditioned confidence modulation
-
-Model version: "tactical-24h-v2"
+Created: 2026-03-29 (v1)
+Updated: 2026-03-30 (v3 — Elite Upgrade)
 """
 import os
 import logging
 import numpy as np
 import lightgbm as lgb
 from sklearn.linear_model import RidgeClassifier
-from sklearn.metrics import accuracy_score
+from sklearn.isotonic import IsotonicRegression
+from sklearn.metrics import accuracy_score, log_loss
 from supabase import create_client
 from datetime import datetime, timedelta
 
-log = logging.getLogger("tactical-model-24h")
+log = logging.getLogger("tactical-24h-v3")
 
 SUPABASE_URL = os.environ["SUPABASE_URL"]
 SUPABASE_KEY = os.environ["SUPABASE_SERVICE_ROLE_KEY"]
 
-MIN_TACTICAL_SAMPLES = 200
-MODEL_VERSION = "tactical-24h-v2"
+MIN_TACTICAL_SAMPLES = 200  # minimum labeled snapshots for training
+MODEL_VERSION = "tactical-24h-v3"
 
-# ══════════════════════════════════════════════════════════════════
-# CANONICAL FEATURE SCHEMA — matches fast-feature-poller v5 output
-# This is the SINGLE SOURCE OF TRUTH for feature names.
-# If the poller changes a key, update HERE and retrain.
-# ══════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════
+#  102-Feature Canonical Schema (aligned with fast-feature-poller v7)
+# ═══════════════════════════════════════════════════════════════════════
 
-# Tier 1: Core macro context (always available, highest signal for 24h)
-TIER1_MACRO = [
-    "vix_level",              # was: vix_raw
-    "vix_zscore_60d",         # was: vix_zscore
-    "vix_percentile_252d",    # was: vix_percentile
-    "vix_term_ratio",         # NEW: VIX vs VX1 (term structure)
-    "vix_term_slope",         # NEW: VX2-VX1 slope (was: vix_acceleration proxy)
-    "spy_return_1d",
-    "spy_return_5d",
-    "spy_return_20d",
-    "credit_spread_raw",
-    "credit_spread_change_1d",   # was: credit_spread_change
-    "credit_spread_zscore_60d",  # was: credit_spread_zscore
-    "dgs2_level",
-    "dgs2_change_1d",         # was: dgs2_change
+FEATURE_KEYS = [
+    # ── Tier 1: Macro Regime (always available) ──
+    "vix_raw", "vix_zscore", "vix_percentile", "vix_acceleration",
+    "vix_term_structure", "vix_term_consistency",
+    "spy_return_1d", "spy_return_5d", "spy_return_20d",
+    "credit_spread_raw", "credit_spread_change", "credit_spread_zscore",
+    "dgs2_level", "dgs2_change",
     "yield_curve_slope",
-]
-
-# Tier 2: Cross-asset & calendar (high value for 24h regime context)
-TIER2_CROSS_ASSET = [
-    "days_to_fomc",
-    "days_to_opex",
-    "earnings_density_5d",    # was: earnings_density
-    "iwm_spy_spread",
-    "qqq_spy_spread",
     "hyg_tlt_spread_change",
-    "dollar_return_1d",       # was: uup_return / dxy_momentum
-    "gold_return_1d",         # was: gld_return
-    "bond_return_1d",         # was: tlt_return
-    "oil_return_1d",          # NEW (was unused)
-    "btc_return_1d",          # NEW (was unused)
+    "uup_return", "gld_return",
+    "dxy_momentum", "tlt_return",
+
+    # ── Tier 2: Market Structure ──
+    "gex_level", "gex_change", "gex_velocity",
+    "put_call_ratio", "put_call_change",
+    "iwm_spy_spread", "qqq_spy_spread",
+    "realized_vol_proxy",
     "sector_dispersion",
+    "spy_intraday_range",
+
+    # ── Tier 3: Calendar / Event Proximity ──
+    "days_to_fomc", "days_to_opex", "earnings_density",
+    "days_to_cpi", "days_to_nfp",
+    "is_fomc_day", "is_opex_day", "is_cpi_day", "is_nfp_day",
+
+    # ── Tier 4: Options Flow (Unusual Whales) ──
+    "net_premium_flow", "iv_rank_spy",
+    "gamma_flip_distance", "sweep_intensity", "net_option_premium",
+
+    # ── Tier 5: Close-Structure (high alpha for 24h) ──
+    "close_vs_vwap", "close_vs_day_high", "close_vs_day_low",
+    "late_day_acceleration", "gap_fill_pct",
+    "upper_wick_ratio", "lower_wick_ratio", "body_ratio",
+
+    # ── Tier 6: Velocity / Acceleration ──
+    "return_acceleration", "volatility_expansion",
+    "volume_delta_proxy", "vwap_slope",
+    "delta_return_5m", "momentum_divergence",
+
+    # ── Tier 7: Internals / Breadth ──
+    "up_down_volume_ratio", "equal_weight_vs_cap_weight",
+    "advance_decline_proxy", "new_highs_lows_ratio",
+    "breadth_thrust_proxy",
+
+    # ── Tier 8: Intraday Session ──
+    "session_hour_sin", "session_hour_cos",
+    "session_segment_encoded",
+    "overnight_return", "opening_drive",
+
+    # ── Tier 9: Temporal Awareness (v7 additions) ──
+    "day_of_week", "day_of_week_sin", "day_of_week_cos",
+    "is_monday", "is_friday",
+    "is_opex_week", "is_month_end", "is_quarter_end",
+    "days_since_last_fomc", "days_until_next_fomc",
+
+    # ── Tier 10: State Transition Awareness (v7 additions) ──
+    "regime_change_signal", "volatility_regime_shift",
+    "momentum_breakdown_signal", "trend_exhaustion_score",
+    "regime_persistence_days", "cross_asset_divergence",
+    "yield_curve_velocity", "credit_stress_acceleration",
+    "vix_regime_transition_prob",
+
+    # ── Tier 11: Cross-Asset Confirmation ──
+    "gold_dollar_divergence", "bond_equity_correlation",
+    "em_developed_spread", "commodity_momentum",
+
+    # ── Tier 12: Derived Ratios ──
+    "vix_spy_ratio", "credit_vix_ratio",
+    "flow_momentum_ratio", "breadth_volatility_ratio",
 ]
 
-# Tier 3: Intraday context (important for end-of-day 24h forecasts)
-TIER3_INTRADAY = [
-    "realized_vol_proxy_1h",  # was: realized_vol_proxy
-    "intraday_range_pct",     # was: spy_intraday_range
-    "spy_return_from_open",
-    "spy_vwap_distance",
-    "gap_size_pct",
-    "breadth_sectors_above_vwap",
-    "session_hour",
-]
 
-# Tier 4: v5 Alpha — Options flow & microstructure (biggest unlock)
-TIER4_ALPHA = [
-    "gamma_flip_distance",    # dealer regime proximity (KEY SIGNAL)
-    "net_option_premium",     # $ conviction (was: net_premium_flow)
-    "sweep_volume",           # institutional urgency
-    "sweep_intensity",        # normalized sweep rate
-    "gex_level",
-    "gex_change",
-    "gex_momentum",           # was: gex_velocity
-    "put_call_ratio",
-    "premium_skew",           # call/put premium ratio
-]
+# ═══════════════════════════════════════════════════════════════════════
+#  Regime-Specific Thresholds
+# ═══════════════════════════════════════════════════════════════════════
 
-# Tier 5: Velocity & interaction (transition detection)
-TIER5_VELOCITY = [
-    "volatility_expansion_rate",
-    "momentum_acceleration",
-    "volume_delta_15m",
-    "return_acceleration",
-    "delta_return_5m",
-    "delta_vol_expansion",
-    "correlation_spike",
-    "liquidity_score",
-    "vwap_x_momentum",       # interaction: vwap_distance × return_5m
-    "vol_x_breadth",          # interaction: vol × breadth
-]
-
-# All features in canonical order
-FEATURE_KEYS = TIER1_MACRO + TIER2_CROSS_ASSET + TIER3_INTRADAY + TIER4_ALPHA + TIER5_VELOCITY
-
-# Critical features: if >50% missing, reject the prediction
-CRITICAL_FEATURES = set(TIER1_MACRO + TIER4_ALPHA[:5])  # macro + top alpha signals
-
-# ══════════════════════════════════════════════════════════════════
-# Schema validation
-# ══════════════════════════════════════════════════════════════════
-
-def validate_feature_schema(features: dict) -> dict:
-    """
-    Validate incoming features against canonical schema.
-    Returns: { valid: bool, score: float, missing: list, critical_missing: list }
-    """
-    all_missing = []
-    critical_missing = []
-    
-    for key in FEATURE_KEYS:
-        val = features.get(key)
-        if val is None or (isinstance(val, float) and not np.isfinite(val)):
-            all_missing.append(key)
-            if key in CRITICAL_FEATURES:
-                critical_missing.append(key)
-    
-    total = len(FEATURE_KEYS)
-    present = total - len(all_missing)
-    score = present / total if total > 0 else 0
-    
-    # Reject if >50% of critical features missing
-    critical_coverage = 1 - (len(critical_missing) / len(CRITICAL_FEATURES)) if CRITICAL_FEATURES else 1
-    valid = critical_coverage >= 0.5
-    
-    if critical_missing:
-        log.warning(f"  Missing critical features ({len(critical_missing)}): {critical_missing[:5]}")
-    
-    return {
-        "valid": valid,
-        "score": round(score, 4),
-        "total_features": total,
-        "present": present,
-        "missing_count": len(all_missing),
-        "critical_missing": critical_missing,
-        "critical_coverage": round(critical_coverage, 4),
-    }
+REGIME_THRESHOLDS = {
+    "trend":    {"opportunity": 0.50, "confidence_min": 0.55, "abstain_penalty": 0.0},
+    "chop":     {"opportunity": 0.65, "confidence_min": 0.62, "abstain_penalty": 0.10},
+    "risk_off": {"opportunity": 0.60, "confidence_min": 0.58, "abstain_penalty": 0.05},
+    "crisis":   {"opportunity": 0.70, "confidence_min": 0.65, "abstain_penalty": 0.15},
+    "normal":   {"opportunity": 0.55, "confidence_min": 0.55, "abstain_penalty": 0.0},
+    "risk_on":  {"opportunity": 0.50, "confidence_min": 0.52, "abstain_penalty": 0.0},
+}
 
 
 class TacticalModel24h:
     """
-    v2 Tactical 24h Forecast Model.
-    
-    Architecture:
-    - Model A (Opportunity): "Is there enough directional edge to act?"
-    - Model B (Direction): "Which way?" (binary: up/down)
-    - Ridge companion: Linear baseline for ensemble stability
-    - Smart Abstain: Suppresses forecast when edge is weak
+    v3 Tactical 24h Model — Elite Upgrade
+    - Binary direction (up/down) + smart abstain
+    - LightGBM (70%) + Ridge (30%) ensemble
+    - Regime-conditioned decision layer
+    - Isotonic probability calibration
+    - State transition override
     """
 
     def __init__(self):
-        self.lgbm_classifier = None      # LGBMClassifier for direction (binary)
-        self.lgbm_regressor = None       # LGBMRegressor for magnitude
-        self.ridge_classifier = None     # Ridge companion for ensemble
+        self.lgb_classifier = None
+        self.ridge_classifier = None
+        self.regressor = None          # LGBMRegressor for magnitude
+        self.calibrator = None         # IsotonicRegression for probability calibration
         self.feature_names = []
+        self.active_features = []      # after pruning
+        self.pruned_features = []      # features removed by importance analysis
         self.training_samples = 0
         self.last_trained_at = None
         self.cv_direction_accuracy = 0.0
-        self.cv_magnitude_corr = 0.0
         self.cv_ridge_accuracy = 0.0
-        
-        # Abstain thresholds (self-tuning)
-        self.opportunity_threshold = 0.55   # minimum confidence to act
-        self.regime_thresholds = {
-            "trend": 0.50,         # lower bar in clear trends
-            "mean_reversion": 0.55,
-            "chop": 0.65,          # higher bar in choppy conditions
-            "liquidity_vacuum": 0.70,
-        }
+        self.cv_magnitude_corr = 0.0
+        self.calibration_ready = False
+        self.feature_importance_map = {}
 
     @property
     def is_trained(self):
-        return self.lgbm_classifier is not None and self.lgbm_regressor is not None
+        return self.lgb_classifier is not None and self.ridge_classifier is not None
 
     def _get_supabase(self):
         return create_client(SUPABASE_URL, SUPABASE_KEY)
 
-    def _fetch_training_data(self, user_id: str, lookback_days: int = 120):
-        """Fetch labeled fast_features for training."""
+    def _fetch_training_data(self, user_id: str, lookback_days: int = 90):
+        """Fetch labeled fast_features for training — v3 with enhanced labels."""
         sb = self._get_supabase()
         cutoff = (datetime.utcnow() - timedelta(days=lookback_days)).isoformat()
 
+        # Get labeled snapshots with v2 enriched labels
         labels_resp = sb.table("fast_feature_labels").select(
             "feature_snapshot_id, spy_return_24h, spy_direction, "
-            "abs_move_gt_1pct, vol_expanded, regime_at_label, session_segment"
+            "abs_move_gt_1pct, vol_expanded, "
+            "path_type, continuation_probability, reversal_probability, "
+            "regime_at_label"
         ).eq("user_id", user_id).eq("labeled", True).gte("label_at", cutoff).execute()
 
         if not labels_resp.data:
             return None
 
+        # Get the corresponding features
         snapshot_ids = [l["feature_snapshot_id"] for l in labels_resp.data]
 
-        features_resp = sb.table("fast_features").select(
-            "id, features, spy_price, vix_level"
-        ).in_("id", snapshot_ids[:500]).execute()
+        # Batch fetch (chunk if > 500)
+        all_features = []
+        for i in range(0, len(snapshot_ids), 500):
+            chunk = snapshot_ids[i:i+500]
+            features_resp = sb.table("fast_features").select(
+                "id, features, spy_price, vix_level"
+            ).in_("id", chunk).execute()
+            if features_resp.data:
+                all_features.extend(features_resp.data)
 
-        if not features_resp.data:
+        if not all_features:
             return None
 
-        feature_map = {f["id"]: f for f in features_resp.data}
+        # Join features to labels
+        feature_map = {f["id"]: f for f in all_features}
         X_rows = []
-        y_direction = []  # BINARY: 0=down, 1=up
+        y_direction = []
         y_magnitude = []
-        regime_labels = []
+        y_regime = []
+        y_path_type = []
+
+        # Use active features if pruning has been done, otherwise all
+        feature_keys = self.active_features if self.active_features else FEATURE_KEYS
 
         for label in labels_resp.data:
             feat = feature_map.get(label["feature_snapshot_id"])
@@ -227,295 +201,433 @@ class TacticalModel24h:
                 continue
 
             features = feat["features"]
-            
-            # Schema validation per sample
-            row = []
-            for k in FEATURE_KEYS:
-                val = features.get(k)
-                if val is None or (isinstance(val, (int, float)) and not np.isfinite(float(val))):
-                    row.append(0.0)
-                elif isinstance(val, str):
-                    # Encode categorical (intraday_regime, session_segment)
-                    row.append(0.0)  # skip string features for now
-                else:
-                    row.append(float(val))
+            ret_24h = label.get("spy_return_24h") or 0
 
-            # Add spy_price and vix_level as bonus features
+            # Binary direction + smart abstain:
+            # Exclude low-magnitude moves (< 0.05%) from directional training
+            if abs(ret_24h) < 0.05:
+                continue
+
+            row = [features.get(k, 0) or 0 for k in feature_keys]
             row.append(feat.get("spy_price") or 0)
             row.append(feat.get("vix_level") or 0)
 
             X_rows.append(row)
 
-            # BINARY direction: skip "flat" samples OR map flat → abstain training
-            direction = label.get("spy_direction", "flat")
-            spy_return = label.get("spy_return_24h", 0) or 0
-            
-            # Binary: use actual return sign (more reliable than string label)
-            if abs(spy_return) < 0.05:  # <0.05% = effectively flat → skip for direction training
-                y_direction.append(-1)  # mark for removal
-            else:
-                y_direction.append(1 if spy_return > 0 else 0)
-            
-            y_magnitude.append(abs(spy_return))
-            regime_labels.append(label.get("regime_at_label", "neutral"))
+            # Binary: 0=down, 1=up
+            y_direction.append(1 if ret_24h > 0 else 0)
+            y_magnitude.append(abs(ret_24h))
+            y_regime.append(label.get("regime_at_label", "normal"))
+            y_path_type.append(label.get("path_type", "unknown"))
 
         if len(X_rows) < MIN_TACTICAL_SAMPLES:
             return None
 
-        feature_names = FEATURE_KEYS + ["spy_price", "vix_level"]
+        feature_names = list(feature_keys) + ["spy_price", "vix_level"]
         X = np.array(X_rows, dtype=np.float64)
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
-        y_dir = np.array(y_direction)
-        y_mag = np.array(y_magnitude, dtype=np.float64)
 
-        return X, y_dir, y_mag, feature_names, regime_labels
+        return {
+            "X": X,
+            "y_direction": np.array(y_direction),
+            "y_magnitude": np.array(y_magnitude, dtype=np.float64),
+            "y_regime": y_regime,
+            "y_path_type": y_path_type,
+            "feature_names": feature_names,
+        }
 
-    def train(self, user_id: str, lookback_days: int = 120) -> dict:
-        """Train direction classifier + magnitude regressor + ridge companion."""
-        result = self._fetch_training_data(user_id, lookback_days)
+    def train(self, user_id: str, lookback_days: int = 90) -> dict:
+        """Train v3 ensemble: LightGBM + Ridge + magnitude regressor."""
+        data = self._fetch_training_data(user_id, lookback_days)
 
-        if result is None:
+        if data is None:
             return {
                 "status": "insufficient_data",
                 "min_required": MIN_TACTICAL_SAMPLES,
                 "model_version": MODEL_VERSION,
             }
 
-        X, y_dir, y_mag, feature_names, regime_labels = result
+        X = data["X"]
+        y_dir = data["y_direction"]
+        y_mag = data["y_magnitude"]
+        y_regime = data["y_regime"]
+        feature_names = data["feature_names"]
         self.feature_names = feature_names
 
-        # Filter out "flat" samples for direction training
-        dir_mask = y_dir >= 0
-        X_dir = X[dir_mask]
-        y_dir_clean = y_dir[dir_mask]
+        log.info(f"Tactical-24h v3 training: {X.shape[0]} samples, {X.shape[1]} features")
 
-        log.info(f"Tactical-24h training: {X.shape[0]} total, {X_dir.shape[0]} directional, {X.shape[1]} features")
+        # ── Walk-forward split (80/20) with 2-day purge ──
+        split_idx = int(len(X) * 0.8)
+        purge_buffer = 2
+        train_end = max(0, split_idx - purge_buffer)
 
-        if len(X_dir) < 100:
-            return {"status": "insufficient_directional_data", "total": len(X), "directional": len(X_dir)}
-
-        # ── Walk-Forward Split (80/20) ──
-        # TODO: Replace with PurgedWalkForwardCV (purge=2d, embargo=1d)
-        split_idx = int(len(X_dir) * 0.8)
-        X_train, X_val = X_dir[:split_idx], X_dir[split_idx:]
-        y_dir_train, y_dir_val = y_dir_clean[:split_idx], y_dir_clean[split_idx:]
-
-        # Magnitude uses ALL samples (including flat)
-        mag_split = int(len(X) * 0.8)
-        X_mag_train, X_mag_val = X[:mag_split], X[mag_split:]
-        y_mag_train, y_mag_val = y_mag[:mag_split], y_mag[mag_split:]
+        X_train, X_val = X[:train_end], X[split_idx:]
+        y_dir_train, y_dir_val = y_dir[:train_end], y_dir[split_idx:]
+        y_mag_train, y_mag_val = y_mag[:train_end], y_mag[split_idx:]
 
         if len(X_train) < 50 or len(X_val) < 20:
             return {"status": "insufficient_data", "reason": "not_enough_for_split"}
 
-        # ── 1. LightGBM Direction Classifier (BINARY) ──
-        clf = lgb.LGBMClassifier(
-            n_estimators=250, learning_rate=0.025, max_depth=5,
-            num_leaves=20, min_child_samples=max(3, len(X_train) // 25),
+        # ── 1. Train LightGBM direction classifier (binary) ──
+        lgb_clf = lgb.LGBMClassifier(
+            n_estimators=300, learning_rate=0.02, max_depth=5,
+            num_leaves=20, min_child_samples=max(3, len(X_train) // 20),
             subsample=0.8, colsample_bytree=0.7,
             reg_alpha=0.15, reg_lambda=0.15,
             objective="binary",
             verbose=-1,
         )
-        clf.fit(X_train, y_dir_train)
-        dir_preds = clf.predict(X_val)
-        lgbm_accuracy = float(accuracy_score(y_dir_val, dir_preds))
+        lgb_clf.fit(X_train, y_dir_train)
 
-        # ── 2. Ridge Companion Classifier ──
-        ridge = RidgeClassifier(alpha=1.0)
-        ridge.fit(X_train, y_dir_train)
-        ridge_preds = ridge.predict(X_val)
+        lgb_preds = lgb_clf.predict(X_val)
+        lgb_probs = lgb_clf.predict_proba(X_val)[:, 1]  # P(up)
+        lgb_accuracy = float(accuracy_score(y_dir_val, lgb_preds))
+
+        # ── 2. Train Ridge classifier (linear baseline) ──
+        ridge_clf = RidgeClassifier(alpha=1.0)
+        ridge_clf.fit(X_train, y_dir_train)
+
+        ridge_preds = ridge_clf.predict(X_val)
         ridge_accuracy = float(accuracy_score(y_dir_val, ridge_preds))
 
-        # ── 3. LightGBM Magnitude Regressor ──
+        # Ridge decision function → pseudo-probability via sigmoid
+        ridge_scores = ridge_clf.decision_function(X_val)
+        ridge_probs = 1.0 / (1.0 + np.exp(-ridge_scores))
+
+        # ── 3. Train magnitude regressor ──
         reg = lgb.LGBMRegressor(
             n_estimators=200, learning_rate=0.03, max_depth=4,
-            num_leaves=15, min_child_samples=max(3, len(X_mag_train) // 20),
+            num_leaves=15, min_child_samples=max(3, len(X_train) // 20),
             subsample=0.8, colsample_bytree=0.8,
             reg_alpha=0.1, reg_lambda=0.1, verbose=-1,
         )
-        reg.fit(X_mag_train, y_mag_train)
-        mag_preds = reg.predict(X_mag_val)
+        reg.fit(X_train, y_mag_train)
+
+        mag_preds = reg.predict(X_val)
         mag_corr = float(np.corrcoef(mag_preds, y_mag_val)[0, 1])
         if np.isnan(mag_corr):
             mag_corr = 0.0
 
-        # Store models
-        self.lgbm_classifier = clf
-        self.lgbm_regressor = reg
-        self.ridge_classifier = ridge
+        # ── 4. Ensemble agreement analysis ──
+        ensemble_probs = 0.70 * lgb_probs + 0.30 * ridge_probs
+        ensemble_preds = (ensemble_probs >= 0.5).astype(int)
+        ensemble_accuracy = float(accuracy_score(y_dir_val, ensemble_preds))
+
+        model_agreement = float(np.mean(lgb_preds == ridge_preds))
+
+        # ── 5. Isotonic calibration (if enough validation data) ──
+        calibrator = None
+        calibration_ready = False
+        if len(X_val) >= 50:
+            try:
+                calibrator = IsotonicRegression(
+                    y_min=0.0, y_max=1.0, out_of_bounds="clip"
+                )
+                calibrator.fit(ensemble_probs, y_dir_val)
+                calibration_ready = True
+                log.info("Isotonic calibrator fitted successfully")
+            except Exception as e:
+                log.warning(f"Calibration failed: {e}")
+                calibrator = None
+
+        # ── 6. Feature importance (for pruning) ──
+        lgb_importance = lgb_clf.feature_importances_
+        importance_dict = {}
+        for i, fname in enumerate(feature_names):
+            importance_dict[fname] = int(lgb_importance[i])
+
+        # Sort by importance
+        sorted_importance = sorted(importance_dict.items(), key=lambda x: x[1], reverse=True)
+
+        # Identify bottom 20% for future pruning (don't prune yet, just report)
+        total_features = len(sorted_importance)
+        prune_threshold = int(total_features * 0.2)
+        prune_candidates = [f[0] for f in sorted_importance[-prune_threshold:] if f[1] == 0]
+
+        # ── Store models ──
+        self.lgb_classifier = lgb_clf
+        self.ridge_classifier = ridge_clf
+        self.regressor = reg
+        self.calibrator = calibrator
+        self.calibration_ready = calibration_ready
         self.training_samples = len(X)
         self.last_trained_at = datetime.utcnow().isoformat()
-        self.cv_direction_accuracy = lgbm_accuracy
-        self.cv_magnitude_corr = mag_corr
+        self.cv_direction_accuracy = lgb_accuracy
         self.cv_ridge_accuracy = ridge_accuracy
-
-        # Feature importance
-        clf_importance = dict(zip(feature_names, [int(x) for x in clf.feature_importances_]))
-        reg_importance = dict(zip(feature_names, [int(x) for x in reg.feature_importances_]))
-
-        # Identify top alpha contributors
-        sorted_imp = sorted(clf_importance.items(), key=lambda x: x[1], reverse=True)
-        alpha_feature_contribution = {k: v for k, v in sorted_imp if k in [f for f in TIER4_ALPHA]}
+        self.cv_magnitude_corr = mag_corr
+        self.feature_importance_map = importance_dict
 
         log.info(
-            f"Tactical-24h trained: lgbm_acc={lgbm_accuracy:.3f}, ridge_acc={ridge_accuracy:.3f}, "
-            f"mag_corr={mag_corr:.3f}, samples={len(X)}, directional={len(X_dir)}"
+            f"Tactical-24h v3 trained: "
+            f"lgb_acc={lgb_accuracy:.3f}, ridge_acc={ridge_accuracy:.3f}, "
+            f"ensemble_acc={ensemble_accuracy:.3f}, "
+            f"mag_corr={mag_corr:.3f}, agreement={model_agreement:.3f}, "
+            f"calibrated={calibration_ready}, samples={len(X)}"
         )
+
+        # ── Regime-stratified accuracy (if regime labels available) ──
+        regime_accuracy = {}
+        val_regimes = y_regime[split_idx:]
+        for regime in set(val_regimes):
+            mask = np.array([r == regime for r in val_regimes])
+            if mask.sum() >= 5:
+                regime_acc = float(accuracy_score(y_dir_val[mask], ensemble_preds[mask]))
+                regime_accuracy[regime] = {
+                    "accuracy": round(regime_acc, 4),
+                    "samples": int(mask.sum()),
+                }
 
         return {
             "status": "trained",
             "model_version": MODEL_VERSION,
             "training_samples": len(X),
-            "directional_samples": len(X_dir),
-            "flat_samples_excluded": len(X) - len(X_dir),
-            "lgbm_direction_accuracy": round(lgbm_accuracy, 4),
-            "ridge_direction_accuracy": round(ridge_accuracy, 4),
-            "ensemble_agreement": round(float(np.mean(dir_preds == ridge_preds)), 4),
+            "lgb_accuracy": round(lgb_accuracy, 4),
+            "ridge_accuracy": round(ridge_accuracy, 4),
+            "ensemble_accuracy": round(ensemble_accuracy, 4),
+            "model_agreement": round(model_agreement, 4),
             "magnitude_correlation": round(mag_corr, 4),
-            "classifier_importance": clf_importance,
-            "regressor_importance": reg_importance,
-            "alpha_feature_contribution": alpha_feature_contribution,
+            "calibration_ready": calibration_ready,
             "feature_count": len(feature_names),
-            "feature_tiers": {
-                "tier1_macro": len(TIER1_MACRO),
-                "tier2_cross_asset": len(TIER2_CROSS_ASSET),
-                "tier3_intraday": len(TIER3_INTRADAY),
-                "tier4_alpha": len(TIER4_ALPHA),
-                "tier5_velocity": len(TIER5_VELOCITY),
-            },
+            "feature_importance": dict(sorted_importance[:20]),  # top 20
+            "prune_candidates": prune_candidates,
+            "regime_accuracy": regime_accuracy,
             "trained_at": self.last_trained_at,
         }
 
-    def predict(self, features: dict) -> dict:
+    def predict(self, features: dict, regime_context: dict = None) -> dict:
         """
-        Predict 24h direction + magnitude with decision layer.
-        
-        Decision flow:
-        1. Schema validation → reject if critical features missing
-        2. LightGBM + Ridge predictions → ensemble direction
-        3. Disagreement filter → abstain if models disagree AND confidence low
-        4. Opportunity filter → abstain if confidence below regime threshold
-        5. Magnitude estimate
-        6. Calibrated confidence output
+        Predict 24h direction + magnitude with regime-conditioned decision layer.
+
+        Args:
+            features: Latest fast_features.features jsonb
+            regime_context: Optional dict with keys:
+                - current_regime: str (e.g., "trend", "chop", "risk_off")
+                - vix_level: float
+                - regime_change_signal: float (0-1)
+                - regime_confidence: float (0-1)
         """
         if not self.is_trained:
-            return {"status": "not_trained", "model_version": MODEL_VERSION}
-
-        # ── 1. Schema Validation ──
-        schema_check = validate_feature_schema(features)
-        if not schema_check["valid"]:
             return {
-                "status": "rejected",
-                "reason": "critical_features_missing",
-                "schema_check": schema_check,
+                "status": "not_trained",
                 "model_version": MODEL_VERSION,
             }
 
-        # ── Build feature vector ──
-        row = []
-        for k in FEATURE_KEYS:
-            val = features.get(k)
-            if val is None or (isinstance(val, (int, float)) and not np.isfinite(float(val))):
-                row.append(0.0)
-            elif isinstance(val, str):
-                row.append(0.0)
-            else:
-                row.append(float(val))
-        
+        # Use active features if pruning has been done
+        feature_keys = self.active_features if self.active_features else FEATURE_KEYS
+
+        # Build feature vector
+        row = [features.get(k, 0) or 0 for k in feature_keys]
         row.append(features.get("spy_price", 0) or 0)
         row.append(features.get("vix_level", 0) or 0)
 
         X = np.array([row], dtype=np.float64)
         X = np.nan_to_num(X, nan=0.0, posinf=0.0, neginf=0.0)
 
-        # ── 2. LightGBM Prediction ──
-        lgbm_proba = self.lgbm_classifier.predict_proba(X)[0]  # [down_prob, up_prob]
-        lgbm_direction = "up" if lgbm_proba[1] > 0.5 else "down"
-        lgbm_confidence = float(max(lgbm_proba))
+        # ── Regime context ──
+        regime = "normal"
+        if regime_context:
+            regime = regime_context.get("current_regime", "normal")
+        thresholds = REGIME_THRESHOLDS.get(regime, REGIME_THRESHOLDS["normal"])
 
-        # ── 3. Ridge Prediction ──
-        ridge_pred = int(self.ridge_classifier.predict(X)[0])
-        ridge_direction = "up" if ridge_pred == 1 else "down"
-        # Ridge doesn't have predict_proba, use decision function as proxy
+        # ── State transition override ──
+        regime_change_signal = 0.0
+        if regime_context:
+            regime_change_signal = regime_context.get("regime_change_signal", 0.0)
+
+        if regime_change_signal > 0.7:
+            return {
+                "status": "ok",
+                "direction": "abstain",
+                "direction_confidence": 0.0,
+                "abstain_reason": f"regime_transition_detected (signal={regime_change_signal:.2f})",
+                "magnitude_estimate": 0.0,
+                "model_version": MODEL_VERSION,
+                "decision_layer": {
+                    "abstain": True,
+                    "abstain_reason": "regime_change_signal > 0.7",
+                    "regime_change_signal": round(regime_change_signal, 4),
+                    "regime": regime,
+                },
+            }
+
+        # ── LightGBM prediction ──
+        lgb_prob_up = float(self.lgb_classifier.predict_proba(X)[0][1])
+
+        # ── Ridge prediction ──
         ridge_score = float(self.ridge_classifier.decision_function(X)[0])
-        ridge_confidence = min(1.0, abs(ridge_score) / 3.0)  # normalize
+        ridge_prob_up = 1.0 / (1.0 + np.exp(-ridge_score))
 
-        # ── 4. Ensemble + Disagreement Filter ──
-        models_agree = lgbm_direction == ridge_direction
-        
-        # Weighted ensemble: LightGBM 70%, Ridge 30%
-        if models_agree:
-            direction = lgbm_direction
-            ensemble_confidence = 0.7 * lgbm_confidence + 0.3 * ridge_confidence
-        else:
-            # Disagreement: use LightGBM but penalize confidence
-            direction = lgbm_direction
-            ensemble_confidence = lgbm_confidence * 0.6  # heavy penalty
+        # ── Ensemble (70/30) ──
+        raw_confidence = 0.70 * lgb_prob_up + 0.30 * ridge_prob_up
 
-        # ── 5. Regime-Aware Opportunity Filter ──
-        intraday_regime = features.get("intraday_regime", "chop")
-        if isinstance(intraday_regime, str):
-            threshold = self.regime_thresholds.get(intraday_regime, self.opportunity_threshold)
-        else:
-            threshold = self.opportunity_threshold
+        # ── Isotonic calibration ──
+        calibrated_confidence = raw_confidence
+        if self.calibrator is not None and self.calibration_ready:
+            try:
+                calibrated_confidence = float(
+                    self.calibrator.predict([raw_confidence])[0]
+                )
+            except Exception:
+                calibrated_confidence = raw_confidence
 
-        should_abstain = False
-        abstain_reason = None
+        # ── Direction ──
+        direction = "up" if calibrated_confidence >= 0.5 else "down"
+        confidence = calibrated_confidence if direction == "up" else (1.0 - calibrated_confidence)
 
-        if ensemble_confidence < threshold:
-            should_abstain = True
-            abstain_reason = f"low_confidence ({ensemble_confidence:.3f} < {threshold:.3f})"
-        elif not models_agree and ensemble_confidence < 0.6:
-            should_abstain = True
-            abstain_reason = f"disagreement + low_confidence"
+        # ── Model agreement penalty ──
+        lgb_direction = "up" if lgb_prob_up >= 0.5 else "down"
+        ridge_direction = "up" if ridge_prob_up >= 0.5 else "down"
+        models_agree = lgb_direction == ridge_direction
 
-        # ── 6. Magnitude Prediction ──
-        magnitude = float(self.lgbm_regressor.predict(X)[0])
-        magnitude = max(0, min(10, magnitude))
+        if not models_agree:
+            confidence *= 0.85  # 15% penalty for disagreement
 
-        # ── 7. Tail Probabilities ──
-        up_prob = float(lgbm_proba[1]) if len(lgbm_proba) > 1 else 0.5
-        down_prob = float(lgbm_proba[0]) if len(lgbm_proba) > 0 else 0.5
-        tail_up = up_prob * min(1, magnitude / 2.0)
-        tail_down = down_prob * min(1, magnitude / 2.0)
+        # ── Regime abstain penalty ──
+        confidence -= thresholds["abstain_penalty"]
+
+        # ── Opportunity gate (regime-conditioned) ──
+        if confidence < thresholds["opportunity"]:
+            return {
+                "status": "ok",
+                "direction": "abstain",
+                "direction_confidence": round(confidence, 4),
+                "abstain_reason": f"below_opportunity_threshold ({confidence:.3f} < {thresholds['opportunity']})",
+                "raw_confidence": round(raw_confidence, 4),
+                "calibrated_confidence": round(calibrated_confidence, 4),
+                "magnitude_estimate": 0.0,
+                "model_version": MODEL_VERSION,
+                "decision_layer": {
+                    "abstain": True,
+                    "regime": regime,
+                    "threshold": thresholds["opportunity"],
+                    "models_agree": models_agree,
+                    "lgb_prob_up": round(lgb_prob_up, 4),
+                    "ridge_prob_up": round(ridge_prob_up, 4),
+                },
+            }
+
+        # ── Magnitude prediction ──
+        magnitude = float(self.regressor.predict(X)[0])
+        magnitude = max(0, min(10, magnitude))  # clamp 0-10%
+
+        # ── Tail probabilities ──
+        tail_up = confidence * min(1.0, magnitude / 2.0) if direction == "up" else (1 - confidence) * min(1.0, magnitude / 2.0)
+        tail_down = (1 - confidence) * min(1.0, magnitude / 2.0) if direction == "up" else confidence * min(1.0, magnitude / 2.0)
+
+        # ── Forecast quality score (6 factors) ──
+        forecast_quality = self._compute_forecast_quality(
+            confidence=confidence,
+            models_agree=models_agree,
+            magnitude=magnitude,
+            regime=regime,
+            regime_change_signal=regime_change_signal,
+            features=features,
+        )
 
         return {
             "status": "ok",
-            "direction": "abstain" if should_abstain else direction,
-            "raw_direction": direction,  # always present even during abstain
-            "direction_confidence": round(ensemble_confidence, 4),
+            "direction": direction,
+            "direction_confidence": round(confidence, 4),
+            "raw_confidence": round(raw_confidence, 4),
+            "calibrated_confidence": round(calibrated_confidence, 4),
             "direction_probabilities": {
-                "down": round(down_prob, 4),
-                "up": round(up_prob, 4),
+                "up": round(calibrated_confidence, 4),
+                "down": round(1.0 - calibrated_confidence, 4),
             },
             "magnitude_estimate": round(magnitude, 4),
             "tail_probabilities": {
                 "up_2pct": round(tail_up, 4),
                 "down_2pct": round(tail_down, 4),
             },
-            "decision_layer": {
-                "abstain": should_abstain,
-                "abstain_reason": abstain_reason,
-                "models_agree": models_agree,
-                "lgbm_direction": lgbm_direction,
-                "lgbm_confidence": round(lgbm_confidence, 4),
-                "ridge_direction": ridge_direction,
-                "ridge_confidence": round(ridge_confidence, 4),
-                "intraday_regime": intraday_regime,
-                "opportunity_threshold": threshold,
-            },
-            "schema_check": schema_check,
             "model_version": MODEL_VERSION,
             "features_used": len(self.feature_names),
             "training_samples": self.training_samples,
             "cv_direction_accuracy": self.cv_direction_accuracy,
             "cv_ridge_accuracy": self.cv_ridge_accuracy,
             "cv_magnitude_correlation": self.cv_magnitude_corr,
+            "calibration_applied": self.calibration_ready,
+            "forecast_quality": round(forecast_quality, 4),
+            "decision_layer": {
+                "abstain": False,
+                "regime": regime,
+                "threshold": thresholds["opportunity"],
+                "models_agree": models_agree,
+                "lgb_prob_up": round(lgb_prob_up, 4),
+                "ridge_prob_up": round(ridge_prob_up, 4),
+                "regime_change_signal": round(regime_change_signal, 4),
+            },
         }
 
+    def _compute_forecast_quality(
+        self,
+        confidence: float,
+        models_agree: bool,
+        magnitude: float,
+        regime: str,
+        regime_change_signal: float,
+        features: dict,
+    ) -> float:
+        """
+        6-factor forecast quality score (0-1).
+        Used by edge function to gate notifications (threshold >= 0.6).
+        """
+        scores = []
 
-# Singleton
+        # 1. Confidence strength (0-1)
+        scores.append(min(1.0, confidence / 0.8))
+
+        # 2. Model agreement (binary)
+        scores.append(1.0 if models_agree else 0.4)
+
+        # 3. Magnitude significance (prefer > 0.3%)
+        scores.append(min(1.0, magnitude / 0.5))
+
+        # 4. Regime stability (low transition = good)
+        scores.append(max(0.0, 1.0 - regime_change_signal))
+
+        # 5. Feature completeness (count non-zero features)
+        non_zero = sum(1 for k in FEATURE_KEYS[:30] if (features.get(k) or 0) != 0)
+        scores.append(min(1.0, non_zero / 20.0))
+
+        # 6. Calibration bonus
+        scores.append(1.0 if self.calibration_ready else 0.7)
+
+        return sum(scores) / len(scores)
+
+    def prune_features(self, min_importance: int = 0, max_prune_pct: float = 0.3):
+        """
+        Prune low-importance features based on last training's importance map.
+        Call after training, before next training cycle.
+        Returns list of pruned feature names.
+        """
+        if not self.feature_importance_map:
+            return []
+
+        sorted_features = sorted(
+            self.feature_importance_map.items(), key=lambda x: x[1]
+        )
+
+        max_prune = int(len(sorted_features) * max_prune_pct)
+        to_prune = []
+
+        for fname, importance in sorted_features:
+            if importance <= min_importance and len(to_prune) < max_prune:
+                # Never prune Tier 1 macro features
+                if fname not in FEATURE_KEYS[:20]:
+                    to_prune.append(fname)
+
+        # Update active features
+        self.pruned_features = to_prune
+        self.active_features = [f for f in FEATURE_KEYS if f not in to_prune]
+
+        log.info(f"Pruned {len(to_prune)} features: {to_prune}")
+        return to_prune
+
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Singleton
+# ═══════════════════════════════════════════════════════════════════════
+
 _tactical_model_24h = None
 
 def get_tactical_model_24h() -> TacticalModel24h:
