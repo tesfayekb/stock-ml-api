@@ -9,6 +9,19 @@ from typing import Optional
 from regime_hmm import get_hmm
 from tactical_model import get_tactical_model_24h, TacticalModel24h  # v2: was get_tactical_model
 from tactical_model_2h import get_tactical_model_2h, TacticalModel2h
+from magnitude_v2 import (
+    extract_features as mag_extract_features,
+    FEATURE_VERSION as MAG_FEATURE_VERSION,
+    train_baseline_model,
+    predict_baseline,
+    train_earnings_model,
+    train_event_model,
+    blend_predictions,
+    compute_dynamic_weights,
+    compute_disagreement,
+    SpecialistOutput,
+    MagnitudeCalibrator,
+)
 
 import httpx
 import numpy as np
@@ -995,3 +1008,422 @@ async def regime_predict(request: Request):
             "probabilities": {"risk_on": 25, "normal": 25, "risk_off": 25, "crisis": 25},
             "confidence": 0.0,
         }
+
+# ═══════════════════════════════════════════════════════════════════════
+#  Magnitude v2 — Specialist Model Endpoints (Shadow Mode)
+# ═══════════════════════════════════════════════════════════════════════
+
+class MagnitudeV2TrainRequest(BaseModel):
+    user_id: str
+    tickers: list[str] | None = None       # None = all tracked tickers
+    specialist_types: list[str] = ["baseline", "earnings", "event"]
+    lookback_days: int = 365
+    purge_days: int = 3
+    embargo_days: int = 2
+    callback_url: str | None = None
+
+
+class MagnitudeV2PredictRequest(BaseModel):
+    user_id: str
+    ticker: str
+    horizon_days: int = 3
+    include_quantiles: bool = True
+    include_path_class: bool = True
+
+
+class MagnitudeV2CalibrateRequest(BaseModel):
+    user_id: str
+    specialist_type: str = "baseline"
+    lookback_days: int = 90
+
+
+# ── In-memory specialist model cache ─────────────────────────────────
+_mag_v2_models: dict = {}  # { "baseline:{ticker}": trained_model, ... }
+_mag_v2_calibrators: dict = {}  # { "baseline": MagnitudeCalibrator, ... }
+
+
+def _get_supabase_client():
+    """Lazy import to avoid circular deps."""
+    from supabase_client import get_client
+    return get_client()
+
+
+@app.post("/magnitude-v2/train")
+async def magnitude_v2_train(
+    req: MagnitudeV2TrainRequest,
+    background_tasks: BackgroundTasks,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Train magnitude v2 specialist models.
+    Trains baseline, earnings, and/or event specialists per ticker.
+    Results stored in magnitude_v2_specialist_outputs + calibration tables.
+    """
+    verify_caller(authorization)
+    log.info(f"Magnitude v2 train: specialists={req.specialist_types}, "
+             f"tickers={req.tickers or 'all'}, user={req.user_id[:8]}...")
+
+    try:
+        sb = _get_supabase_client()
+
+        # Resolve tickers
+        tickers = req.tickers
+        if not tickers:
+            # Fetch all tracked tickers from stock_impact_profiles
+            resp = sb.table("stock_impact_profiles") \
+                .select("ticker") \
+                .eq("user_id", req.user_id) \
+                .execute()
+            tickers = list(set(r["ticker"] for r in resp.data)) if resp.data else []
+
+        if not tickers:
+            return {"status": "no_tickers", "success": False}
+
+        results = {"status": "trained", "success": True, "tickers": {}, "summary": {}}
+        total_trained = 0
+        total_skipped = 0
+
+        for ticker in tickers:
+            ticker = ticker.upper()
+            ticker_result = {"specialists": {}}
+
+            # Fetch score_deltas for feature building
+            raw = fetch_score_deltas(ticker, req.user_id, req.lookback_days)
+            if len(raw) < MIN_SAMPLES:
+                ticker_result["status"] = "insufficient_data"
+                ticker_result["rows"] = len(raw)
+                results["tickers"][ticker] = ticker_result
+                total_skipped += 1
+                continue
+
+            # Extract magnitude v2 features
+            features = mag_extract_features(raw, ticker, req.user_id)
+            if features is None:
+                ticker_result["status"] = "feature_extraction_failed"
+                results["tickers"][ticker] = ticker_result
+                total_skipped += 1
+                continue
+
+            X = features["X"]
+            y_signed = features["y_signed"]
+            y_abs = features["y_abs"]
+            dates = features["dates"]
+            feature_names = features["feature_names"]
+
+            # Train each requested specialist
+            if "baseline" in req.specialist_types:
+                try:
+                    baseline_result = train_baseline_model(
+                        X, y_signed, y_abs, dates, feature_names,
+                        purge_days=req.purge_days,
+                        embargo_days=req.embargo_days,
+                    )
+                    _mag_v2_models[f"baseline:{ticker}"] = baseline_result.get("model")
+                    ticker_result["specialists"]["baseline"] = {
+                        k: v for k, v in baseline_result.items() if k != "model"
+                    }
+                    total_trained += 1
+                except Exception as e:
+                    log.warning(f"Baseline train failed for {ticker}: {e}")
+                    ticker_result["specialists"]["baseline"] = {"status": "error", "error": str(e)}
+
+            if "earnings" in req.specialist_types:
+                try:
+                    earnings_result = train_earnings_model(
+                        X, y_signed, y_abs, dates, feature_names,
+                        raw_data=raw,
+                        purge_days=req.purge_days + 2,  # wider purge for earnings
+                        embargo_days=req.embargo_days + 1,
+                    )
+                    _mag_v2_models[f"earnings:{ticker}"] = earnings_result.get("model")
+                    ticker_result["specialists"]["earnings"] = {
+                        k: v for k, v in earnings_result.items() if k != "model"
+                    }
+                    total_trained += 1
+                except Exception as e:
+                    log.warning(f"Earnings train failed for {ticker}: {e}")
+                    ticker_result["specialists"]["earnings"] = {"status": "error", "error": str(e)}
+
+            if "event" in req.specialist_types:
+                try:
+                    event_result = train_event_model(
+                        X, y_signed, y_abs, dates, feature_names,
+                        raw_data=raw,
+                        purge_days=req.purge_days,
+                        embargo_days=req.embargo_days,
+                    )
+                    _mag_v2_models[f"event:{ticker}"] = event_result.get("model")
+                    ticker_result["specialists"]["event"] = {
+                        k: v for k, v in event_result.items() if k != "model"
+                    }
+                    total_trained += 1
+                except Exception as e:
+                    log.warning(f"Event train failed for {ticker}: {e}")
+                    ticker_result["specialists"]["event"] = {"status": "error", "error": str(e)}
+
+            ticker_result["status"] = "trained"
+            results["tickers"][ticker] = ticker_result
+
+        results["summary"] = {
+            "total_tickers": len(tickers),
+            "trained": total_trained,
+            "skipped": total_skipped,
+            "feature_version": MAG_FEATURE_VERSION,
+        }
+
+        # Send callback if provided
+        if req.callback_url:
+            await _send_callback(req.callback_url, {
+                **results,
+                "model_type": "magnitude_v2",
+                "user_id": req.user_id,
+            })
+            return {"accepted": True, "tickers": len(tickers)}
+
+        return results
+
+    except Exception as e:
+        log.exception("Magnitude v2 train failed")
+        error_result = {
+            "success": False,
+            "error": str(e),
+            "user_id": req.user_id,
+            "model_type": "magnitude_v2",
+        }
+        if req.callback_url:
+            await _send_callback(req.callback_url, error_result)
+            return {"accepted": True, "status": "error"}
+        raise HTTPException(500, str(e))
+
+
+@app.post("/magnitude-v2/predict")
+async def magnitude_v2_predict(
+    req: MagnitudeV2PredictRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Predict magnitude using v2 specialist ensemble.
+    Returns: expected move, quantiles (q10-q90), path class, threshold probs,
+    disagreement metrics, certainty level.
+    All predictions stored with is_shadow=TRUE until v2 is validated.
+    """
+    verify_caller(authorization)
+    ticker = req.ticker.upper()
+
+    try:
+        sb = _get_supabase_client()
+
+        # Get latest features for this ticker
+        raw = fetch_score_deltas(ticker, req.user_id, 30)
+        if not raw:
+            return {"status": "no_data", "ticker": ticker, "success": False}
+
+        features = mag_extract_features(raw[-1:], ticker, req.user_id)
+        if features is None:
+            return {"status": "feature_extraction_failed", "ticker": ticker, "success": False}
+
+        X_latest = features["X"][-1:]
+
+        # Collect specialist predictions
+        specialists: list[SpecialistOutput] = []
+
+        # Baseline specialist
+        baseline_model = _mag_v2_models.get(f"baseline:{ticker}")
+        if baseline_model:
+            try:
+                baseline_pred = predict_baseline(baseline_model, X_latest)
+                specialists.append(baseline_pred)
+            except Exception as e:
+                log.warning(f"Baseline predict failed for {ticker}: {e}")
+
+        # Earnings specialist (only if near earnings)
+        earnings_model = _mag_v2_models.get(f"earnings:{ticker}")
+        if earnings_model:
+            try:
+                from magnitude_v2.earnings_model import predict_earnings
+                earnings_pred = predict_earnings(earnings_model, X_latest)
+                specialists.append(earnings_pred)
+            except Exception as e:
+                log.warning(f"Earnings predict failed for {ticker}: {e}")
+
+        # Event specialist
+        event_model = _mag_v2_models.get(f"event:{ticker}")
+        if event_model:
+            try:
+                from magnitude_v2.event_model import predict_event
+                event_pred = predict_event(event_model, X_latest)
+                specialists.append(event_pred)
+            except Exception as e:
+                log.warning(f"Event predict failed for {ticker}: {e}")
+
+        if not specialists:
+            return {
+                "status": "no_specialists_available",
+                "ticker": ticker,
+                "success": False,
+                "hint": "Run /magnitude-v2/train first",
+            }
+
+        # Fetch calibration metrics
+        cal_resp = sb.table("magnitude_v2_calibration") \
+            .select("*") \
+            .eq("user_id", req.user_id) \
+            .execute()
+        cal_metrics = {}
+        if cal_resp.data:
+            for row in cal_resp.data:
+                cal_metrics[row["specialist_type"]] = {
+                    "mae": row.get("mae", 999),
+                    "rmse": row.get("rmse", 999),
+                    "signed_bias": row.get("signed_bias", 0),
+                }
+
+        # Detect event context
+        has_earnings = any(s.specialist_type == "earnings" for s in specialists)
+        has_catalyst = any(s.specialist_type == "event" for s in specialists)
+
+        # Compute dynamic weights
+        weights = compute_dynamic_weights(
+            specialists, cal_metrics,
+            regime_state="unknown",  # TODO: pull from regime classifier
+            has_earnings=has_earnings,
+            has_catalyst=has_catalyst,
+        )
+
+        # Compute disagreement
+        disagreement = compute_disagreement(specialists)
+
+        # Blend predictions
+        prediction = blend_predictions(
+            specialists, weights, disagreement,
+            regime_state="unknown",
+            vol_regime="normal",
+        )
+
+        # Store as shadow prediction
+        prediction["ticker"] = ticker
+        prediction["user_id"] = req.user_id
+        prediction["is_shadow"] = True
+        prediction["horizon_days"] = req.horizon_days
+        prediction["feature_version"] = MAG_FEATURE_VERSION
+        prediction["success"] = True
+
+        # Write to magnitude_v2_predictions
+        try:
+            sb.table("magnitude_v2_predictions").insert({
+                "user_id": req.user_id,
+                "ticker": ticker,
+                "horizon_days": req.horizon_days,
+                "expected_move_pct": prediction["expected_move_pct"],
+                "expected_abs_move_pct": prediction["expected_abs_move_pct"],
+                "ci_low": prediction["ci_low"],
+                "ci_high": prediction["ci_high"],
+                "q10": prediction.get("q10", 0),
+                "q25": prediction.get("q25", 0),
+                "q50": prediction.get("q50", 0),
+                "q75": prediction.get("q75", 0),
+                "q90": prediction.get("q90", 0),
+                "path_class": prediction.get("path_class", "drift"),
+                "path_confidence": prediction.get("path_confidence", 0),
+                "certainty_level": prediction.get("certainty_level", "low"),
+                "meta_confidence": prediction.get("meta_confidence", 0),
+                "specialist_weights": prediction.get("specialist_weights", {}),
+                "winning_specialist": prediction.get("winning_specialist"),
+                "specialist_disagreement": prediction.get("specialist_disagreement", 0),
+                "disagreement_action": prediction.get("disagreement_action", "none"),
+                "is_shadow": True,
+                "feature_version": MAG_FEATURE_VERSION,
+                "regime_state": prediction.get("regime_state", "unknown"),
+                "vol_regime": prediction.get("vol_regime", "normal"),
+            }).execute()
+        except Exception as e:
+            log.warning(f"Failed to store v2 prediction: {e}")
+
+        return prediction
+
+    except Exception as e:
+        log.exception(f"Magnitude v2 predict failed for {ticker}")
+        raise HTTPException(500, str(e))
+
+
+@app.post("/magnitude-v2/calibrate")
+async def magnitude_v2_calibrate(
+    req: MagnitudeV2CalibrateRequest,
+    authorization: Optional[str] = Header(None),
+):
+    """
+    Run calibration for a specialist type using resolved predictions.
+    Updates magnitude_v2_calibration table with MAE, RMSE, CI coverage, bias.
+    """
+    verify_caller(authorization)
+    log.info(f"Magnitude v2 calibrate: type={req.specialist_type}, user={req.user_id[:8]}...")
+
+    try:
+        sb = _get_supabase_client()
+
+        # Fetch resolved predictions for this specialist
+        resp = sb.table("magnitude_v2_predictions") \
+            .select("*") \
+            .eq("user_id", req.user_id) \
+            .eq("winning_specialist", req.specialist_type) \
+            .not_.is_("actual_move_pct", "null") \
+            .order("predicted_at", desc=True) \
+            .limit(500) \
+            .execute()
+
+        if not resp.data or len(resp.data) < 20:
+            return {
+                "status": "insufficient_resolved",
+                "samples": len(resp.data) if resp.data else 0,
+                "min_required": 20,
+            }
+
+        predictions = [r["expected_move_pct"] for r in resp.data]
+        actuals = [r["actual_move_pct"] for r in resp.data]
+        ci_lows = [r["ci_low"] for r in resp.data]
+        ci_highs = [r["ci_high"] for r in resp.data]
+
+        calibrator = MagnitudeCalibrator()
+        cal_result = calibrator.calibrate(predictions, actuals, ci_lows, ci_highs)
+
+        _mag_v2_calibrators[req.specialist_type] = calibrator
+
+        # Upsert calibration metrics
+        sb.table("magnitude_v2_calibration").upsert({
+            "user_id": req.user_id,
+            "specialist_type": req.specialist_type,
+            "subgroup_key": "global",
+            "mae": cal_result["mae"],
+            "rmse": cal_result["rmse"],
+            "signed_bias": cal_result["signed_bias"],
+            "ci_coverage_80": cal_result.get("ci_coverage_80"),
+            "ci_coverage_90": cal_result.get("ci_coverage_90"),
+            "total_samples": len(predictions),
+            "recent_samples_30d": cal_result.get("recent_samples_30d", 0),
+            "is_trusted": cal_result.get("is_trusted", False),
+            "trust_reason": cal_result.get("trust_reason"),
+            "calibration_method": "isotonic_conformal",
+        }, on_conflict="user_id,specialist_type,subgroup_key").execute()
+
+        return {
+            "status": "calibrated",
+            "specialist_type": req.specialist_type,
+            "success": True,
+            **cal_result,
+        }
+
+    except Exception as e:
+        log.exception("Magnitude v2 calibrate failed")
+        raise HTTPException(500, str(e))
+
+
+@app.get("/magnitude-v2/health")
+async def magnitude_v2_health():
+    """Health check for magnitude v2 subsystem."""
+    return {
+        "status": "ok",
+        "loaded_models": list(_mag_v2_models.keys()),
+        "loaded_calibrators": list(_mag_v2_calibrators.keys()),
+        "feature_version": MAG_FEATURE_VERSION,
+        "mode": "shadow",
+    }
