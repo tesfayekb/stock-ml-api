@@ -1218,9 +1218,101 @@ async def magnitude_v2_predict(
         if not raw:
             return {"status": "no_data", "ticker": ticker, "success": False}
 
-        features = mag_extract_features(raw[-1:], ticker, req.user_id)
+        # ── Build inputs for extract_features() ──
+        sector = get_sector(ticker)
+
+        # Market context
+        ff_resp = sb.table("fast_features") \
+            .select("vix_level, features") \
+            .eq("user_id", req.user_id) \
+            .order("snapshot_at", desc=True) \
+            .limit(1) \
+            .execute()
+        ff = ff_resp.data[0] if ff_resp.data else {}
+        ff_feat = ff.get("features", {}) if isinstance(ff.get("features"), dict) else {}
+
+        spy_resp = sb.table("live_ticks") \
+            .select("price") \
+            .eq("ticker", "SPY") \
+            .order("received_at", desc=True) \
+            .limit(10) \
+            .execute()
+        spy_prices = [r["price"] for r in reversed(spy_resp.data or [])]
+
+        market_data = {
+            "vix": ff.get("vix_level", 20),
+            "vix_3m": ff_feat.get("vix_3m", ff.get("vix_level", 20)),
+            "credit_spread": ff_feat.get("credit_spread", 0),
+            "dxy": ff_feat.get("dollar_index", 0),
+            "spy_prices": spy_prices,
+        }
+
+        # Stock data
+        fund_resp = sb.table("fundamentals_cache") \
+            .select("beta, implied_volatility, short_percent_float, short_ratio") \
+            .eq("ticker", ticker) \
+            .eq("user_id", req.user_id) \
+            .order("fetched_at", desc=True) \
+            .limit(1) \
+            .execute()
+        fund = fund_resp.data[0] if fund_resp.data else {}
+
+        stock_data = {
+            "prices": [r.get("actual_move_3d", 0) for r in raw if r.get("actual_move_3d") is not None],
+            "volumes": [],
+            "opens": [],
+            "closes": [],
+            "rsi14": 50,
+            "bb_position": 0.5,
+            "atr_pct": 1.0,
+            "beta": fund.get("beta", 1.0),
+        }
+
+        # Sector data
+        sector_data = {
+            "sector": sector or "Unknown",
+            "etf_prices": [],
+            "dispersion": 0,
+        }
+
+        # Event data
+        event_resp = sb.table("events") \
+            .select("magnitude, direction, event_type") \
+            .eq("ticker", ticker) \
+            .eq("user_id", req.user_id) \
+            .gte("created_at", (datetime.utcnow() - timedelta(days=7)).isoformat()) \
+            .execute()
+        events = event_resp.data or []
+
+        event_data = {
+            "has_earnings": any(e.get("event_type") == "earnings" for e in events),
+            "days_to_earnings": None,
+            "crowding": len(events),
+            "catalyst_count_7d": len(events),
+            "earnings_density": 0,
+        }
+
+        # Options & fundamentals
+        options_data = {
+            "implied_vol": fund.get("implied_volatility", 0),
+            "skew": 0,
+            "term_slope": 0,
+            "put_call_ratio": 0,
+            "implied_move": 0,
+        }
+
+        fundamentals = {
+            "short_interest_ratio": fund.get("short_ratio", 0),
+            "short_interest_change": 0,
+        }
+
+        features = mag_extract_features(
+            ticker, market_data, stock_data, sector_data, event_data,
+            options_data, fundamentals,
+        )
         if features is None:
             return {"status": "feature_extraction_failed", "ticker": ticker, "success": False}
+
 
         X_latest = features["X"][-1:]
 
