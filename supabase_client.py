@@ -152,3 +152,7 @@ def write_optimized_weights(
     ).execute()
 
     return {"weights_written": len(weights), "is_new_best": is_new_best}
+
+# Alias for magnitude_v2 module compatibility
+get_client = get_supabase
+
