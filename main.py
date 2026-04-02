@@ -26,6 +26,7 @@ from magnitude_v2 import (
 import httpx
 import numpy as np
 import lightgbm as lgb
+from datetime import datetime, timedelta
 from fastapi import FastAPI, HTTPException, Header, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -1096,19 +1097,19 @@ async def magnitude_v2_train(
                 total_skipped += 1
                 continue
 
-            # Extract magnitude v2 features
-            features = mag_extract_features(raw, ticker, req.user_id)
-            if features is None:
-                ticker_result["status"] = "feature_extraction_failed"
+            # Build training matrix from score_deltas (not extract_features, which is prediction-only)
+            X, y, factor_names, dates = build_factor_matrix(raw, "actual_move_3d")
+            if X is None or len(X) < MIN_SAMPLES:
+                ticker_result["status"] = "insufficient_data"
+                ticker_result["rows"] = len(raw)
                 results["tickers"][ticker] = ticker_result
                 total_skipped += 1
                 continue
 
-            X = features["X"]
-            y_signed = features["y_signed"]
-            y_abs = features["y_abs"]
-            dates = features["dates"]
-            feature_names = features["feature_names"]
+            y_signed = y
+            y_abs = np.abs(y)
+            feature_names = factor_names
+
 
             # Train each requested specialist
             if "baseline" in req.specialist_types:
@@ -1118,7 +1119,7 @@ async def magnitude_v2_train(
                         purge_days=req.purge_days,
                         embargo_days=req.embargo_days,
                     )
-                    _mag_v2_models[f"baseline:{ticker}"] = baseline_result.get("model")
+                    _mag_v2_models[f"baseline:{ticker}"] = baseline_result
                     ticker_result["specialists"]["baseline"] = {
                         k: v for k, v in baseline_result.items() if k != "model"
                     }
@@ -1135,7 +1136,7 @@ async def magnitude_v2_train(
                         purge_days=req.purge_days + 2,  # wider purge for earnings
                         embargo_days=req.embargo_days + 1,
                     )
-                    _mag_v2_models[f"earnings:{ticker}"] = earnings_result.get("model")
+                    _mag_v2_models[f"earnings:{ticker}"] = earnings_result
                     ticker_result["specialists"]["earnings"] = {
                         k: v for k, v in earnings_result.items() if k != "model"
                     }
@@ -1152,7 +1153,7 @@ async def magnitude_v2_train(
                         purge_days=req.purge_days,
                         embargo_days=req.embargo_days,
                     )
-                    _mag_v2_models[f"event:{ticker}"] = event_result.get("model")
+                    _mag_v2_models[f"event:{ticker}"] = event_result
                     ticker_result["specialists"]["event"] = {
                         k: v for k, v in event_result.items() if k != "model"
                     }
@@ -1310,11 +1311,22 @@ async def magnitude_v2_predict(
             ticker, market_data, stock_data, sector_data, event_data,
             options_data, fundamentals,
         )
-        if features is None:
+        if not features:
             return {"status": "feature_extraction_failed", "ticker": ticker, "success": False}
 
+        # extract_features returns a flat dict, not a matrix — build X from feature names
+        baseline_state = _mag_v2_models.get(f"baseline:{ticker}")
+        if not isinstance(baseline_state, dict) or "features_used" not in baseline_state:
+            return {
+                "status": "no_trained_model",
+                "ticker": ticker,
+                "success": False,
+                "hint": "Run /magnitude-v2/train first to establish feature schema",
+            }
 
-        X_latest = features["X"][-1:]
+        feature_names = baseline_state["features_used"]
+        X_latest = np.array([[features.get(name, 0) or 0 for name in feature_names]], dtype=float)
+
 
         # Collect specialist predictions
         specialists: list[SpecialistOutput] = []
@@ -1323,7 +1335,13 @@ async def magnitude_v2_predict(
         baseline_model = _mag_v2_models.get(f"baseline:{ticker}")
         if baseline_model:
             try:
-                baseline_pred = predict_baseline(baseline_model, X_latest)
+                baseline_pred = predict_baseline(
+                    baseline_model,
+                    X_latest[0],
+                    baseline_model["point_model"],
+                    baseline_model["quantile_models"],
+                )
+
                 specialists.append(baseline_pred)
             except Exception as e:
                 log.warning(f"Baseline predict failed for {ticker}: {e}")
