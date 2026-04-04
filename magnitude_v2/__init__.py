@@ -83,7 +83,7 @@ def load_model_artifact(sb_client, specialist_type: str, ticker: str,
             .eq("user_id", user_id) \
             .eq("specialist_type", specialist_type) \
             .eq("subgroup_key", ticker) \
-            .not_.is_("model_stored_at", "null") \
+            .filter("model_stored_at", "not.is", "null") \
             .order("model_stored_at", desc=True) \
             .limit(1) \
             .execute()
