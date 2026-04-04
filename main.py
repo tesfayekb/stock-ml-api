@@ -21,6 +21,8 @@ from magnitude_v2 import (
     compute_disagreement,
     SpecialistOutput,
     MagnitudeCalibrator,
+    save_model_artifact,
+    load_model_artifact,
 )
 
 import httpx
@@ -1124,6 +1126,17 @@ async def magnitude_v2_train(
                         k: v for k, v in baseline_result.items() if k != "model"
                     }
                     total_trained += 1
+
+                    # v15e: Persist model to Supabase Storage
+                    try:
+                        version = f"v2.0-{datetime.utcnow().strftime('%Y%m%d%H%M')}"
+                        save_result = save_model_artifact(sb, "baseline", ticker, baseline_result, version, req.user_id)
+                        ticker_result["specialists"]["baseline"]["model_stored"] = True
+                        ticker_result["specialists"]["baseline"]["model_version"] = version
+                        ticker_result["specialists"]["baseline"]["storage_path"] = save_result.get("path")
+                    except Exception as store_err:
+                        log.warning(f"Model storage failed for baseline:{ticker}: {store_err}")
+                        ticker_result["specialists"]["baseline"]["model_stored"] = False
                 except Exception as e:
                     log.warning(f"Baseline train failed for {ticker}: {e}")
                     ticker_result["specialists"]["baseline"] = {"status": "error", "error": str(e)}
@@ -1141,6 +1154,16 @@ async def magnitude_v2_train(
                         k: v for k, v in earnings_result.items() if k != "model"
                     }
                     total_trained += 1
+
+                    # v15e: Persist model to Supabase Storage
+                    try:
+                        version = f"v2.0-{datetime.utcnow().strftime('%Y%m%d%H%M')}"
+                        save_model_artifact(sb, "earnings", ticker, earnings_result, version, req.user_id)
+                        ticker_result["specialists"]["earnings"]["model_stored"] = True
+                        ticker_result["specialists"]["earnings"]["model_version"] = version
+                    except Exception as store_err:
+                        log.warning(f"Model storage failed for earnings:{ticker}: {store_err}")
+                        ticker_result["specialists"]["earnings"]["model_stored"] = False
                 except Exception as e:
                     log.warning(f"Earnings train failed for {ticker}: {e}")
                     ticker_result["specialists"]["earnings"] = {"status": "error", "error": str(e)}
@@ -1158,6 +1181,16 @@ async def magnitude_v2_train(
                         k: v for k, v in event_result.items() if k != "model"
                     }
                     total_trained += 1
+
+                    # v15e: Persist model to Supabase Storage
+                    try:
+                        version = f"v2.0-{datetime.utcnow().strftime('%Y%m%d%H%M')}"
+                        save_model_artifact(sb, "event", ticker, event_result, version, req.user_id)
+                        ticker_result["specialists"]["event"]["model_stored"] = True
+                        ticker_result["specialists"]["event"]["model_version"] = version
+                    except Exception as store_err:
+                        log.warning(f"Model storage failed for event:{ticker}: {store_err}")
+                        ticker_result["specialists"]["event"]["model_stored"] = False
                 except Exception as e:
                     log.warning(f"Event train failed for {ticker}: {e}")
                     ticker_result["specialists"]["event"] = {"status": "error", "error": str(e)}
@@ -1314,14 +1347,35 @@ async def magnitude_v2_predict(
         if not features:
             return {"status": "feature_extraction_failed", "ticker": ticker, "success": False}
 
+        # v15e: Load from storage if not in memory (stateless container fix)
+        def _ensure_model(specialist_type: str, t: str):
+            """Check memory first, then storage. Cache after download."""
+            key = f"{specialist_type}:{t}"
+            model = _mag_v2_models.get(key)
+            if model:
+                return model, "memory"
+            # Attempt storage fallback
+            try:
+                model = load_model_artifact(sb, specialist_type, t, req.user_id)
+                if model:
+                    _mag_v2_models[key] = model  # cache in memory
+                    return model, "storage"
+            except Exception as e:
+                log.warning(f"Storage load failed for {specialist_type}:{t}: {e}")
+            return None, "cold_start"
+
+        model_sources: dict[str, str] = {}
+
         # extract_features returns a flat dict, not a matrix — build X from feature names
-        baseline_state = _mag_v2_models.get(f"baseline:{ticker}")
+        baseline_state, baseline_src = _ensure_model("baseline", ticker)
+        model_sources["baseline"] = baseline_src
         if not isinstance(baseline_state, dict) or "features_used" not in baseline_state:
             return {
                 "status": "no_trained_model",
                 "ticker": ticker,
                 "success": False,
-                "hint": "Run /magnitude-v2/train first to establish feature schema",
+                "model_sources": model_sources,
+                "hint": "Run /magnitude-v2/train first to establish feature schema, or check storage persistence",
             }
 
         feature_names = baseline_state["features_used"]
@@ -1331,15 +1385,14 @@ async def magnitude_v2_predict(
         # Collect specialist predictions
         specialists: list[SpecialistOutput] = []
 
-        # Baseline specialist
-        baseline_model = _mag_v2_models.get(f"baseline:{ticker}")
-        if baseline_model:
+        # Baseline specialist (already loaded above)
+        if baseline_state:
             try:
                 baseline_pred = predict_baseline(
-                    baseline_model,
+                    baseline_state,
                     X_latest[0],
-                    baseline_model["point_model"],
-                    baseline_model["quantile_models"],
+                    baseline_state["point_model"],
+                    baseline_state["quantile_models"],
                 )
 
                 specialists.append(baseline_pred)
@@ -1347,7 +1400,8 @@ async def magnitude_v2_predict(
                 log.warning(f"Baseline predict failed for {ticker}: {e}")
 
         # Earnings specialist (only if near earnings)
-        earnings_model = _mag_v2_models.get(f"earnings:{ticker}")
+        earnings_model, earnings_src = _ensure_model("earnings", ticker)
+        model_sources["earnings"] = earnings_src
         if earnings_model:
             try:
                 from magnitude_v2.earnings_model import predict_earnings
@@ -1357,7 +1411,8 @@ async def magnitude_v2_predict(
                 log.warning(f"Earnings predict failed for {ticker}: {e}")
 
         # Event specialist
-        event_model = _mag_v2_models.get(f"event:{ticker}")
+        event_model, event_src = _ensure_model("event", ticker)
+        model_sources["event"] = event_src
         if event_model:
             try:
                 from magnitude_v2.event_model import predict_event
@@ -1371,7 +1426,8 @@ async def magnitude_v2_predict(
                 "status": "no_specialists_available",
                 "ticker": ticker,
                 "success": False,
-                "hint": "Run /magnitude-v2/train first",
+                "model_sources": model_sources,
+                "hint": "Run /magnitude-v2/train first or check storage persistence",
             }
 
         # Fetch calibration metrics
@@ -1417,6 +1473,7 @@ async def magnitude_v2_predict(
         prediction["horizon_days"] = req.horizon_days
         prediction["feature_version"] = MAG_FEATURE_VERSION
         prediction["success"] = True
+        prediction["model_sources"] = model_sources  # v15e: memory/storage/cold_start per specialist
 
         # Write to magnitude_v2_predictions
         try:
@@ -1532,7 +1589,7 @@ async def magnitude_v2_health():
     """Health check for magnitude v2 subsystem."""
     return {
         "status": "ok",
-        "loaded_models": list(_mag_v2_models.keys()),
+        "loaded_models_memory": list(_mag_v2_models.keys()),
         "loaded_calibrators": list(_mag_v2_calibrators.keys()),
         "feature_version": MAG_FEATURE_VERSION,
         "mode": "shadow",
