@@ -1370,7 +1370,7 @@ async def magnitude_v2_predict(
         baseline_state, baseline_src = _ensure_model("baseline", ticker)
         model_sources["baseline"] = baseline_src
         feat_key = "features_used" if "features_used" in (baseline_state or {}) else "feature_names"
-        if not isinstance(baseline_state, dict) or feat_key not in baseline_state:
+        if not isinstance(baseline_state, dict) or feat_key not in baseline_state or not baseline_state[feat_key]:
             return {
                 "status": "no_trained_model",
                 "ticker": ticker,
