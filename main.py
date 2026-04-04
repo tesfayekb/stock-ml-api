@@ -1369,7 +1369,8 @@ async def magnitude_v2_predict(
         # extract_features returns a flat dict, not a matrix — build X from feature names
         baseline_state, baseline_src = _ensure_model("baseline", ticker)
         model_sources["baseline"] = baseline_src
-        if not isinstance(baseline_state, dict) or "features_used" not in baseline_state:
+        feat_key = "features_used" if "features_used" in (baseline_state or {}) else "feature_names"
+        if not isinstance(baseline_state, dict) or feat_key not in baseline_state:
             return {
                 "status": "no_trained_model",
                 "ticker": ticker,
@@ -1377,8 +1378,8 @@ async def magnitude_v2_predict(
                 "model_sources": model_sources,
                 "hint": "Run /magnitude-v2/train first to establish feature schema, or check storage persistence",
             }
+        feature_names = baseline_state[feat_key]
 
-        feature_names = baseline_state["features_used"]
         X_latest = np.array([[features.get(name, 0) or 0 for name in feature_names]], dtype=float)
 
 
