@@ -67,6 +67,7 @@ def train_event_model(
     event_types: list[str] | None = None,
     purge_days: int = 3,
     embargo_days: int = 2,
+    raw_data: list | None = None,
 ) -> dict:
     """
     Train event-driven magnitude model.
@@ -110,6 +111,7 @@ def train_event_model(
         correlation = 0.0
     
     # ── Quantile models ──
+    quantile_models = {}
     quantile_preds = {}
     for q in QUANTILES:
         qmodel = GradientBoostingRegressor(
@@ -118,6 +120,7 @@ def train_event_model(
             min_samples_split=max(5, len(X) // 20),
         )
         qmodel.fit(X, y)
+        quantile_models[q] = qmodel
         quantile_preds[q] = qmodel.predict(X)
     
     coverage_90 = float(np.mean(
@@ -151,6 +154,8 @@ def train_event_model(
         "status": "trained",
         "specialist_type": "event",
         "model_version": "v2.0",
+        "point_model": best_model,
+        "quantile_models": quantile_models,
         "correlation": round(correlation, 4),
         "mae": round(float(mean_absolute_error(y, point_preds)), 4),
         "coverage_90": round(coverage_90, 4),
@@ -160,3 +165,39 @@ def train_event_model(
         "observations": len(X),
         "features_used": feature_names,
     }
+
+
+def predict_event(model_state: dict, X: np.ndarray) -> "SpecialistOutput":
+    """Predict using stored event specialist model."""
+    from .meta_model import SpecialistOutput
+
+    point_model = model_state.get("point_model")
+    quantile_models = model_state.get("quantile_models", {})
+
+    if point_model is None:
+        return SpecialistOutput(
+            specialist_type="event",
+            point_estimate=0.0,
+            quantiles={},
+            confidence=0.0,
+            weight_hint=0.0,
+        )
+
+    X_2d = X.reshape(1, -1) if X.ndim == 1 else X
+    point_pred = float(point_model.predict(X_2d)[0])
+
+    quantiles = {}
+    for q, qmodel in quantile_models.items():
+        quantiles[q] = float(qmodel.predict(X_2d)[0])
+
+    ci_width = quantiles.get(0.90, point_pred + 1) - quantiles.get(0.10, point_pred - 1)
+    confidence = max(0.0, min(1.0, 1.0 - (ci_width / (abs(point_pred) + 1e-6)) * 0.1))
+
+    return SpecialistOutput(
+        specialist_type="event",
+        point_estimate=point_pred,
+        quantiles=quantiles,
+        confidence=round(confidence, 4),
+        weight_hint=1.0,
+    )
+
