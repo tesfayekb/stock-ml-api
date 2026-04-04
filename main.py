@@ -1356,10 +1356,14 @@ async def magnitude_v2_predict(
                 return model, "memory"
             # Attempt storage fallback
             try:
+                log.info(f"Attempting storage load for {specialist_type}:{t}")
                 model = load_model_artifact(sb, specialist_type, t, req.user_id)
                 if model:
-                    _mag_v2_models[key] = model  # cache in memory
+                    _mag_v2_models[key] = model
+                    log.info(f"Storage load SUCCESS for {specialist_type}:{t}, keys={list(model.keys())}")
                     return model, "storage"
+                else:
+                    log.warning(f"Storage load returned None for {specialist_type}:{t}")
             except Exception as e:
                 log.warning(f"Storage load failed for {specialist_type}:{t}: {e}")
             return None, "cold_start"
