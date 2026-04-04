@@ -36,24 +36,10 @@ def save_model_artifact(sb_client, specialist_type: str, ticker: str,
                         model_dict: dict, version: str, user_id: str) -> dict:
     """
     Serialize and upload a trained specialist model to Supabase Storage.
-
-    Path format: magnitude_v2/{specialist_type}/{ticker}/{version}.joblib
-    Also updates magnitude_v2_calibration with model_stored_at and model_version.
-
-    Args:
-        sb_client: Supabase client instance
-        specialist_type: "baseline", "earnings", or "event"
-        ticker: Stock ticker (e.g. "AAPL")
-        model_dict: Dict with point_model, quantile_models, feature_names, etc.
-        version: Version string (e.g. "v2.0-202604041530")
-        user_id: User ID for calibration table update
-
-    Returns:
-        Dict with path, size_bytes, stored_at
+    Path: magnitude_v2/{specialist_type}/{ticker}/{version}.joblib
     """
     storage_path = f"magnitude_v2/{specialist_type}/{ticker}/{version}.joblib"
 
-    # Serialize model to bytes
     buffer = io.BytesIO()
     artifact = {
         "point_model": model_dict.get("point_model"),
@@ -67,14 +53,12 @@ def save_model_artifact(sb_client, specialist_type: str, ticker: str,
     joblib.dump(artifact, buffer)
     model_bytes = buffer.getvalue()
 
-    # Upload to Supabase Storage
     sb_client.storage.from_("ml-models").upload(
         storage_path,
         model_bytes,
         file_options={"content-type": "application/octet-stream", "upsert": "true"},
     )
 
-    # Update calibration row with storage metadata
     sb_client.table("magnitude_v2_calibration").update({
         "model_stored_at": datetime.utcnow().isoformat(),
         "model_version": version,
@@ -83,34 +67,16 @@ def save_model_artifact(sb_client, specialist_type: str, ticker: str,
     ).execute()
 
     log.info(f"Model stored: {storage_path} ({len(model_bytes)} bytes)")
-
-    return {
-        "path": storage_path,
-        "size_bytes": len(model_bytes),
-        "stored_at": datetime.utcnow().isoformat(),
-    }
+    return {"path": storage_path, "size_bytes": len(model_bytes), "stored_at": datetime.utcnow().isoformat()}
 
 
 def load_model_artifact(sb_client, specialist_type: str, ticker: str,
                         user_id: str, version: str = "latest") -> dict | None:
     """
     Download and deserialize a specialist model from Supabase Storage.
-
-    If version=="latest", queries magnitude_v2_calibration for the most recent
-    model_stored_at row to determine the version.
-
-    Args:
-        sb_client: Supabase client instance
-        specialist_type: "baseline", "earnings", or "event"
-        ticker: Stock ticker
-        user_id: User ID for calibration lookup
-        version: Specific version or "latest"
-
-    Returns:
-        Model dict (point_model, quantile_models, feature_names, ...) or None
+    If version=="latest", looks up from magnitude_v2_calibration.
     """
     if version == "latest":
-        # Look up latest version from calibration table
         resp = sb_client.table("magnitude_v2_calibration") \
             .select("model_version, model_stored_at") \
             .eq("user_id", user_id) \
@@ -120,19 +86,16 @@ def load_model_artifact(sb_client, specialist_type: str, ticker: str,
             .order("model_stored_at", desc=True) \
             .limit(1) \
             .execute()
-
         if not resp.data:
             return None
         version = resp.data[0]["model_version"]
 
     storage_path = f"magnitude_v2/{specialist_type}/{ticker}/{version}.joblib"
-
     try:
         data = sb_client.storage.from_("ml-models").download(storage_path)
         if not data:
             log.warning(f"Empty download for {storage_path}")
             return None
-
         buffer = io.BytesIO(data)
         artifact = joblib.load(buffer)
         log.info(f"Model loaded from storage: {storage_path}")
