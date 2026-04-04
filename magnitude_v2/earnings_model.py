@@ -176,7 +176,7 @@ def train_earnings_model(
         "features_used": feature_names,
     }
     
-    def predict_earnings(model_state: dict, X: np.ndarray) -> "SpecialistOutput":
+def predict_earnings(model_state: dict, X: np.ndarray) -> "SpecialistOutput":
     """Predict using stored earnings specialist model."""
     from .meta_model import SpecialistOutput
     
